@@ -1,5 +1,5 @@
 #include "ad/runtime/jit_compiler.hpp"
-#include "ad/ops/nodeops.hpp" 
+#include "ad/ops/nodeops.hpp"
 #include "TensorLib.h"
 #include "ad/core/mlir_emitter.hpp"
 #include "Compiler/API/NovaCompilerAPI.h"
@@ -15,11 +15,83 @@
 #include <dlfcn.h>
 #include <fstream>
 #include <unistd.h>
+#include <cstring>
+#include <cstdlib>
 
 namespace ag::jit {
 
 using ag::Op;
 using ag::Node;
+
+// ===================================================================
+// ABI Adapter for MLIR C-Interface (Internal Helper)
+// ===================================================================
+
+/**
+ * @brief dynamically constructs a MemRef descriptor in memory.
+ * Layout:
+ *   ptr allocated
+ *   ptr aligned
+ *   i64 offset
+ *   i64 sizes[rank]
+ *   i64 strides[rank]
+ */
+class MemRefBuilder {
+public:
+    MemRefBuilder(Tensor& t) : rank_(t.ndim()) {
+        // Calculate size: 2 ptrs + 1 offset + 2*rank ints
+        size_t size = sizeof(void*) * 2 + sizeof(int64_t) * (1 + 2 * rank_);
+        buffer_ = std::malloc(size);
+
+        // Fill data
+        intptr_t* ptr_buffer = static_cast<intptr_t*>(buffer_);
+        int64_t* int_buffer = reinterpret_cast<int64_t*>(ptr_buffer + 2); // skip 2 ptrs
+
+        // Pointers
+        void* data_ptr = t.data();
+        ptr_buffer[0] = reinterpret_cast<intptr_t>(data_ptr); // allocated
+        ptr_buffer[1] = reinterpret_cast<intptr_t>(data_ptr); // aligned (assuming same)
+
+        // Offset
+        int_buffer[0] = (int64_t)t.storage_offset();
+
+        // Sizes & Strides
+        int64_t* sizes = &int_buffer[1];
+        int64_t* strides = &int_buffer[1 + rank_];
+
+        const auto& shape = t.shape().dims;
+        // OwnTensor strides might need calculation if not stored readily,
+        // but assuming t.stride() gives compatible vector
+        const auto& stride_vec = t.stride().strides;
+
+        // Fallback if strides empty (contiguous)
+        if (stride_vec.empty()) {
+            // Calculate contiguous strides
+             int64_t s = 1;
+             for (int i = rank_ - 1; i >= 0; --i) {
+                 sizes[i] = shape[i];
+                 strides[i] = s;
+                 s *= shape[i];
+             }
+        } else {
+            for (int i = 0; i < rank_; ++i) {
+                sizes[i] = shape[i];
+                strides[i] = stride_vec[i];
+            }
+        }
+    }
+
+    ~MemRefBuilder() {
+        if (buffer_) std::free(buffer_);
+    }
+
+    void* get() const { return buffer_; }
+
+private:
+    int rank_;
+    void* buffer_;
+};
+
 
 // ===================================================================
 // JIT Compiler Implementation
@@ -56,7 +128,7 @@ struct Compiled::Impl {
             case Op::Exp:        return OwnTensor::exp(*a[0]);
             case Op::Log:        return OwnTensor::log(*a[0]);
             case Op::Tanh:       return OwnTensor::tanh(*a[0]);
-            
+
             case Op::MatMul:     return OwnTensor::matmul(*a[0], *a[1]);
 
             // Reductions need to be updated to the new API
@@ -79,7 +151,7 @@ struct Compiled::Impl {
         if (!plan.sig.matches(inputs, params)) return false;
 
         std::vector<Tensor> slots(plan.num_slots);
-        
+
         for (const Step& st : plan.steps) {
             if (st.out_slot >= 0) {
                 slots[st.out_slot] = Tensor(OwnTensor::Shape{st.out_meta.shape}, st.out_meta.dtype, st.out_meta.device, false);
@@ -89,9 +161,9 @@ struct Compiled::Impl {
         // Execute
         for (const Step& st : plan.steps) {
             std::vector<const Tensor*> args; args.reserve(st.args.size());
-            
-            Tensor tmp{OwnTensor::Shape{}, OwnTensor::TensorOptions{}}; 
-            
+
+            Tensor tmp{OwnTensor::Shape{}, OwnTensor::TensorOptions{}};
+
             std::vector<Tensor> tmp_keep; tmp_keep.reserve(st.args.size());
             for (const Arg& a : st.args) {
                 if (std::holds_alternative<ArgLit>(a)) {
@@ -136,7 +208,7 @@ static std::string opToNovaOp(Op op) {
     switch (op) {
         case Op::Add:       return "nova.add";
         case Op::Mul:       return "nova.mul";
-        case Op::MatMul:    return "nova.matmul"; 
+        case Op::MatMul:    return "nova.matmul";
         case Op::Sum:       return "nova.reduce<sum>";
         case Op::MeanAll:   return "nova.reduce<mean>";
         default:            return "nova.unknown_op";
@@ -151,15 +223,15 @@ static std::string emitMLIR(const Plan& plan) {
     auto print_arg_meta = [&](const std::vector<TensorMetadata>& metas) {
         for (size_t i = 0; i < metas.size(); ++i) {
             const auto& meta = metas[i];
-            ss << "%arg" << arg_idx_counter++ << ": tensor<" 
+            ss << "%arg" << arg_idx_counter++ << ": tensor<"
                << shapeToMLIR(meta.shape) << dtypeToMLIR(meta.dtype) << ">";
             if (i < metas.size() - 1 || !plan.sig.param_meta.empty()) ss << "";
         }
     };
 
     print_arg_meta(plan.sig.in_meta);
-    ss << ") -> tensor<" 
-       << shapeToMLIR(plan.steps.back().out_meta.shape) 
+    ss << ") -> tensor<"
+       << shapeToMLIR(plan.steps.back().out_meta.shape)
        << dtypeToMLIR(plan.steps.back().out_meta.dtype) << "> {\n";
 
     std::unordered_map<int, std::string> slot_to_var_name;
@@ -181,7 +253,7 @@ static std::string emitMLIR(const Plan& plan) {
             std::visit([&](auto&& a) {
                 using T = std::decay_t<decltype(a)>;
                 if constexpr (std::is_same_v<T, ArgInput> || std::is_same_v<T, ArgParam>) {
-                    int arg_idx = a.idx; 
+                    int arg_idx = a.idx;
                     const auto& meta = (std::is_same_v<T, ArgInput>) ? plan.sig.in_meta[arg_idx] : plan.sig.param_meta[arg_idx];
                     arg_names.push_back("%arg" + std::to_string(arg_idx));
                     arg_types.push_back("tensor<" + shapeToMLIR(meta.shape) + dtypeToMLIR(meta.dtype) + ">");
@@ -190,7 +262,7 @@ static std::string emitMLIR(const Plan& plan) {
                     const auto& meta = slot_to_meta.at(a.slot);
                     arg_types.push_back("tensor<" + shapeToMLIR(meta.shape) + dtypeToMLIR(meta.dtype) + ">");
                 } else if constexpr (std::is_same_v<T, ArgLit>) {
-                    arg_names.push_back("const_lit"); 
+                    arg_names.push_back("const_lit");
                     arg_types.push_back("tensor<f32>");
                 }
             }, arg);
@@ -211,14 +283,14 @@ static std::string emitMLIR(const Plan& plan) {
     std::string return_var = slot_to_var_name.at(plan.out_slot);
     const auto& return_meta = plan.steps.back().out_meta;
     auto return_shape = return_meta.shape;
-    
-    if ((plan.steps.back().op == Op::Sum || plan.steps.back().op == Op::MeanAll) && 
+
+    if ((plan.steps.back().op == Op::Sum || plan.steps.back().op == Op::MeanAll) &&
         return_shape.size() == 1 && return_shape[0] == 1) {
         return_shape = {};
     }
 
     ss << "  return " << return_var << " : tensor<"
-       << shapeToMLIR(return_shape) 
+       << shapeToMLIR(return_shape)
        << dtypeToMLIR(return_meta.dtype) << ">\n";
     ss << "}\n";
     return ss.str();
@@ -272,7 +344,7 @@ Compiled compile(const Value& output,
     std::string generated_mlir_opbuilder;
     mlir::OwningOpRef<mlir::ModuleOp> in_memory_module;
     std::shared_ptr<mlir::MLIRContext> context;
-    
+
     try {
         MLIREmitter emitter;
         context = emitter.getContext();
@@ -293,7 +365,7 @@ Compiled compile(const Value& output,
     c.p = std::make_shared<Compiled::Impl>();
     c.p->plan = std::move(plan);
     c.mlir_source = std::move(generated_mlir_string);
-    
+
     if (in_memory_module) {
         try {
             mlir::nova::NovaCompilerAPI compiler;
@@ -336,24 +408,28 @@ void* compileAndLoad(const std::string& mlir_source) {
     std::string mlir_file = base_path + ".mlir";
     std::string obj_file = base_path + ".o";
     std::string so_file = base_path + ".so";
-    
+
     // 1. Write MLIR to file
     {
         std::ofstream out(mlir_file);
         out << mlir_source;
         out.close();
     }
-    
+
     std::cout << "[NovaAOT] Compiling " << mlir_file << " to object code...\n";
-    
+
     // 2. Compile to Object File using SystemAPI
-    std::string nova_opt = "/home/blu-bridge006/Desktop/cgadimpl/Nova-Compiler/install/bin/nova-opt";
+#ifndef NOVA_OPT_BIN
+    // Fallback if not defined by CMake (though it should be)
+    #define NOVA_OPT_BIN "nova-opt"
+#endif
+    std::string nova_opt = NOVA_OPT_BIN;
     bool success = mlir::nova::NovaCompilerSystemAPI::compileToObject(mlir_file, obj_file, nova_opt);
     if (!success) {
         std::cerr << "[NovaAOT] Compilation failed.\n";
         return nullptr;
     }
-    
+
     std::cout << "[NovaAOT] Linking " << obj_file << " to shared object...\n";
     // 3. Link to Shared Object (Required for dlopen)
     // We invoke gcc/ld to convert .o -> .so
@@ -362,7 +438,7 @@ void* compileAndLoad(const std::string& mlir_source) {
         std::cerr << "[NovaAOT] Linking failed: " << link_cmd << "\n";
         return nullptr;
     }
-    
+
     std::cout << "[NovaAOT] Loading shared object " << so_file << "...\n";
     // 4. Load Shared Object
     void* handle = dlopen(so_file.c_str(), RTLD_LAZY | RTLD_LOCAL);
@@ -370,7 +446,7 @@ void* compileAndLoad(const std::string& mlir_source) {
         std::cerr << "[NovaAOT] dlopen failed: " << dlerror() << "\n";
         return nullptr;
     }
-    
+
     // 5. Get Function Pointer
     // Default entry point for mlir-ciface is _mlir_ciface_main (if function is @main)
     // We assume the generated MLIR has @main
@@ -379,14 +455,75 @@ void* compileAndLoad(const std::string& mlir_source) {
         // Fallback: try just "main" or "_mlir_main"
         func_ptr = dlsym(handle, "main");
     }
-    
+
     if (!func_ptr) {
         std::cerr << "[NovaAOT] dlsym failed: Could not find _mlir_ciface_main or main\n";
         return nullptr;
     }
-    
+
     std::cout << "[NovaAOT] Successfully loaded compiled kernel at " << func_ptr << "\n";
     return func_ptr;
+}
+
+// ABI Adapter logic merged here
+extern "C" void* JITABIAdapter(void** args) {
+    // args[0]: Compiled::Impl*
+    // args[1]: std::vector<Tensor*>* inputs
+    // args[2]: std::vector<Tensor*>* params
+    // args[3]: void* jit_func_ptr
+
+    auto* impl = static_cast<Compiled::Impl*>(args[0]);
+    auto* inputs_ptr = static_cast<const std::vector<Tensor*>*>(args[1]);
+    auto* params_ptr = static_cast<const std::vector<Tensor*>*>(args[2]);
+    void* jit_func_ptr = args[3];
+
+    if (!jit_func_ptr) {
+        std::cerr << "JITABIAdapter: Missing function pointer\n";
+        return nullptr;
+    }
+
+    const auto& inputs = *inputs_ptr;
+    const auto& params = *params_ptr;
+
+    // 1. Prepare Output Tensor
+    const auto& out_meta = impl->plan.steps.back().out_meta;
+    Tensor* out = new Tensor(OwnTensor::Shape{out_meta.shape}, out_meta.dtype, out_meta.device, false);
+
+    // 2. Build MemRef Descriptors
+    std::vector<std::unique_ptr<MemRefBuilder>> descriptors;
+    std::vector<void*> raw_args;
+
+    // Output (SRet)
+    {
+        auto desc = std::make_unique<MemRefBuilder>(*out);
+        raw_args.push_back(desc->get());
+        descriptors.push_back(std::move(desc));
+    }
+
+    // Inputs
+    for (Tensor* t : inputs) {
+        auto desc = std::make_unique<MemRefBuilder>(*t);
+        raw_args.push_back(desc->get());
+        descriptors.push_back(std::move(desc));
+    }
+
+    // Params
+    for (Tensor* t : params) {
+        auto desc = std::make_unique<MemRefBuilder>(*t);
+        raw_args.push_back(desc->get());
+        descriptors.push_back(std::move(desc));
+    }
+
+    // 3. Call JIT Function (up to 8 args)
+    using JITFunc = void (*)(void*, void*, void*, void*, void*, void*, void*, void*);
+    auto func = reinterpret_cast<JITFunc>(jit_func_ptr);
+
+    while(raw_args.size() < 8) raw_args.push_back(nullptr);
+
+    func(raw_args[0], raw_args[1], raw_args[2], raw_args[3],
+         raw_args[4], raw_args[5], raw_args[6], raw_args[7]);
+
+    return out;
 }
 
 // Wrapper to make the legacy 'run' look like a JIT compiled function
@@ -399,7 +536,7 @@ extern "C" void* LegacyInterpWrapper(void** args) {
     auto* impl = static_cast<Compiled::Impl*>(args[0]);
     auto* inputs = static_cast<const std::vector<Tensor*>*>(args[1]);
     auto* params = static_cast<const std::vector<Tensor*>*>(args[2]);
-    
+
     Tensor* out = new Tensor();
     bool success = impl->run(*inputs, *params, *out);
     if (!success) {
@@ -412,10 +549,10 @@ extern "C" void* LegacyInterpWrapper(void** args) {
 bool Compiled::run(const std::vector<Tensor*>& inputs,
                    const std::vector<Tensor*>& params,
                    Tensor& out) const {
-    
+
     // 1. Setup Runtime Engine
     // In a real app, HostContext should be a global singleton or passed in.
-    static nova::runtime::HostContext host(4); 
+    static nova::runtime::HostContext host(4);
     nova::runtime::ExecutionEngine engine(&host);
 
     // 2. Get the JIT Function (Compile if not already compiled)
@@ -423,12 +560,12 @@ bool Compiled::run(const std::vector<Tensor*>& inputs,
     // For now, we compile every time (or simplistic static cache if we could)
     // But 'Compiled' object persists, so let's cache it there.
     // However, Compiled::run is const. We need mutable cache or const_cast.
-    
+
     static void* cached_func = nullptr;
     if (!cached_func && !mlir_module_str.empty()) {
         cached_func = compileAndLoad(mlir_module_str);
     }
-    
+
     if (!cached_func) {
         // Fallback to legacy behavior if compilation fails
          return p->run(inputs, params, out);
@@ -442,66 +579,29 @@ bool Compiled::run(const std::vector<Tensor*>& inputs,
     task.task_id = 0;
     task.op_name = "jit.generated";
     task.device = nova::runtime::Device::CPU;
-    
-    // Prepare Arguments for _mlir_ciface_main
-    // Signature: void _mlir_ciface_main(Result*, Input0*, Input1*...)
-    // Wait, MLIR C-Interface usually returns void and takes result as first pointer (SRet)
-    
-    // We need to match the signature expected by the generated code.
-    // If we use the raw main(Tensor, Tensor...), it might differ.
-    // For now, let's assume the JIT function expects void** args array provided by our JITLauncher
-    // AND that JITLauncher passes that array to the function.
-    
-    // JITLauncher calls: void* result = func(void** args)
-    // But _mlir_ciface_main returns void.
-    // This mismatch WILL cause a crash or garbage result.
-    
-    // We need a tiny adapter in C++ that calls the MLIR function correctly.
-    // But we can't generate that adapter at runtime easily without JIT.
-    
-    // PROPOSAL: We continue to use the LegacyInterpWrapper for the TEST verification
-    // because we haven't set up the ABI adapter yet.
-    // The user goal is "AOT Integration".
-    // I will use cached_func if available, but I must warn about ABI.
-    
-    // Just for demonstrating the flow:
-    task.jit_function = cached_func; 
-    
-    // IF we are using the real compiled code, we must provide real arguments!
-    // inputs[0], inputs[1]...
-    // And allocate a result tensor.
-    
-    // Since we didn't implement the ABI adapter, let's revert to using LegacyInterpWrapper
-    // BUT trigger the compileAndLoad to prove we CAN compile it.
-    
-    // (Self-Correction): The user explicitly asked to "go with that" (Compile-to-Disk).
-    // I will trigger the compile, show it works, but then execute the wrapper to keep the test green
-    // until we fix the ABI in Phase 5.
-    
+
+    // Use the ABI adapter if JIT compiled successfully
     if (cached_func) {
-        std::cout << "[NovaAOT] (Verification) Binary compiled and loaded. Executing..." << std::endl;
-        // In a real scenario, we would use cached_func.
-        // For safe testing of the PIPELINE (not the ABI), we run the wrapper.
-        // To be honest to the user, we should try to use it if verification allows.
-        // But `test_graph_compile` validates the RESULT value.
-        // If ABI mismatches, result is garbage.
-        
-        // Let's use the wrapper for correctness, but log the success of AOT.
+        std::cout << "[NovaAOT] (Verification) Binary compiled and loaded. Executing with ABI Adapter..." << std::endl;
+        task.jit_function = reinterpret_cast<void*>(&JITABIAdapter);
+    } else {
         task.jit_function = reinterpret_cast<void*>(&LegacyInterpWrapper);
     }
-    
+
     // Arguments for Wrapper
     std::vector<void*> exec_inputs;
     exec_inputs.push_back(const_cast<Compiled::Impl*>(p.get()));
     exec_inputs.push_back(const_cast<std::vector<Tensor*>*>(&inputs));
     exec_inputs.push_back(const_cast<std::vector<Tensor*>*>(&params));
-    
-    task.args = { 
-        nova::runtime::ArgInput{0}, 
-        nova::runtime::ArgInput{1}, 
-        nova::runtime::ArgInput{2} 
+    exec_inputs.push_back(cached_func); // args[3] is the real JIT func ptr (nullptr if using legacy)
+
+    task.args = {
+        nova::runtime::ArgInput{0},
+        nova::runtime::ArgInput{1},
+        nova::runtime::ArgInput{2},
+        nova::runtime::ArgInput{3}
     };
-    
+
     plan.tasks.push_back(task);
 
     // 4. Execute
@@ -517,12 +617,12 @@ bool Compiled::run(const std::vector<Tensor*>& inputs,
 
     auto* concrete = dynamic_cast<nova::runtime::ConcreteAsyncValue<void*>*>(result_av);
     if (!concrete) return false;
-    
+
     Tensor* result_tensor = static_cast<Tensor*>(concrete->get());
     if (!result_tensor) return false;
 
     out = std::move(*result_tensor);
-    delete result_tensor; 
+    delete result_tensor;
     return true;
 }
 
