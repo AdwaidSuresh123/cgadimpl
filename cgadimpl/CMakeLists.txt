@@ -58,6 +58,11 @@ target_include_directories(cgadimpl PRIVATE /usr/local/cuda/include)
 # target_link_libraries(cgadimpl PUBLIC OwnTensor::tensor dl)
 target_compile_definitions(cgadimpl PUBLIC WITH_CUDA)
 
+get_filename_component(NOVA_COMPILER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../Nova-Compiler" ABSOLUTE)
+set(NOVA_OPT_PATH "${NOVA_COMPILER_ROOT}/install/bin/nova-opt")
+target_compile_definitions(cgadimpl PRIVATE NOVA_OPT_BIN="${NOVA_OPT_PATH}")
+
+
 # Filter out /usr/include to avoid system header issues
 if(LLVM_INCLUDE_DIRS)
     list(REMOVE_ITEM LLVM_INCLUDE_DIRS "/usr/include")
