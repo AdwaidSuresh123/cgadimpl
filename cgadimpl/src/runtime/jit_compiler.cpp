@@ -346,9 +346,13 @@ void* compileAndLoad(const std::string& mlir_source) {
     
     std::cout << "[NovaAOT] Compiling " << mlir_file << " to object code...\n";
     
-    // 2. Compile to Object File using SystemAPI
-    std::string nova_opt = "/home/blu-bridge006/Desktop/cgadimpl/Nova-Compiler/install/bin/nova-opt";
-    bool success = mlir::nova::NovaCompilerSystemAPI::compileToObject(mlir_file, obj_file, nova_opt);
+        // 2. Compile to Object File using SystemAPI
+    #ifndef NOVA_OPT_BIN
+ 
+        #define NOVA_OPT_BIN "nova-opt"
+    #endif
+        std::string nova_opt = NOVA_OPT_BIN;
+        bool success = mlir::nova::NovaCompilerSystemAPI::compileToObject(mlir_file, obj_file, nova_opt);
     if (!success) {
         std::cerr << "[NovaAOT] Compilation failed.\n";
         return nullptr;
