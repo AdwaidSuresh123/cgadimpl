@@ -10,6 +10,8 @@
 #include "llvm/Support/raw_ostream.h"
 #include <sstream>
 
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+
 namespace ag::jit {
 
 MLIREmitter::MLIREmitter() {
@@ -24,6 +26,7 @@ void MLIREmitter::registerDialects() {
     // Optimization and bufferization are now handled within NovaCompilerAPI.
     context_->getOrLoadDialect<mlir::nova::NovaDialect>();
     context_->getOrLoadDialect<mlir::func::FuncDialect>();
+    context_->getOrLoadDialect<mlir::LLVM::LLVMDialect>(); // For Adapter (ptr manipulation)
 }
 
 mlir::Type MLIREmitter::dtypeToMLIRType(mlir::OpBuilder& builder, OwnTensor::Dtype dtype) {
@@ -92,6 +95,7 @@ MLIREmitter::emitModule(const Plan& plan) {
 
     // Create function
     auto func = builder.create<mlir::func::FuncOp>(loc, "main", funcType);
+    func->setAttr("llvm.emit_c_interface", builder.getUnitAttr());
     auto& entryBlock = *func.addEntryBlock();
     builder.setInsertionPointToStart(&entryBlock);
 

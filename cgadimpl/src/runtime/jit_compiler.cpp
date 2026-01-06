@@ -301,8 +301,8 @@ Compiled compile(const Value& output,
             options.runFullPipeline = true;
             auto compileResult = compiler.compileString(generated_mlir_opbuilder, "", options);
             if (compileResult.success) {
-                // generated_mlir_opbuilder = compileResult.output;
-                std::cout << "\n=== Optimized MLIR Generated via NovaCompilerAPI ===\n" << std::endl;
+                generated_mlir_opbuilder = compileResult.output;
+                std::cout << "\n=== Optimized MLIR Generated via NovaCompilerAPI ===\n" << generated_mlir_opbuilder << std::endl;
             } else {
                 std::cerr << "Warning: NovaCompilerAPI pipeline failed: " << compileResult.errorMessage << "\n";
             }
