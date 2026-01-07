@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <cmath> 
 #include <type_traits> 
+#include "mlp/loss.h"
 
 namespace ag {
 namespace detail {
@@ -62,6 +63,48 @@ std::shared_ptr<Node> kldivergence_nodeops(const std::shared_ptr<Node>& logits, 
     n->inputs = {logits, onehot};
     if (logits) logits->child_grad_count++;
     if (onehot) onehot->child_grad_count++;
+    ag::debug::on_node_created(n);
+    return n;
+}
+
+std::shared_ptr<Node> binary_cross_entropy_nodeops(const std::shared_ptr<Node>& pred, const std::shared_ptr<Node>& target) {
+
+    // Tensor diff = pred->value - target->value;
+    // Tensor sq   = diff * diff;
+    // // --- THIS IS THE BUG ---
+    // // It should be reduce_mean, not reduce_sum. `reduce_mean` correctly
+    // // computes the VJP for the mean operation. `sum` has a different VJP.
+    // Tensor loss = OwnTensor::reduce_mean(sq); 
+    Tensor loss = OwnTensor::mlp_forward::binary_cross_entropy(pred->value, target->value);
+    // --- END BUG ---
+
+    auto n = std::make_shared<Node>(loss, Op::BinaryCrossEntropy, (pred->requires_grad() || target->requires_grad()), "binary_cross_entropy");
+    n->inputs = {pred, target};
+
+    if (pred) pred->child_grad_count++;
+    if (target) target->child_grad_count++;
+
+    ag::debug::on_node_created(n);
+    return n;
+}
+
+std::shared_ptr<Node> categorical_cross_entropy_nodeops(const std::shared_ptr<Node>& pred, const std::shared_ptr<Node>& target) {
+
+    // Tensor diff = pred->value - target->value;
+    // Tensor sq   = diff * diff;
+    // // --- THIS IS THE BUG ---
+    // // It should be reduce_mean, not reduce_sum. `reduce_mean` correctly
+    // // computes the VJP for the mean operation. `sum` has a different VJP.
+    // Tensor loss = OwnTensor::reduce_mean(sq); 
+    Tensor loss = OwnTensor::mlp_forward::categorical_cross_entropy(pred->value, target->value);
+    // --- END BUG ---
+
+    auto n = std::make_shared<Node>(loss, Op::CategoricalCrossEntropy, (pred->requires_grad() || target->requires_grad()), "categorical_cross_entropy");
+    n->inputs = {pred, target};
+
+    if (pred) pred->child_grad_count++;
+    if (target) target->child_grad_count++;
+
     ag::debug::on_node_created(n);
     return n;
 }

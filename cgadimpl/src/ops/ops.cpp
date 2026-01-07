@@ -119,35 +119,6 @@ namespace ag {
         return Value(ag::detail::transpose_nodeops(x.node));
     }
 
-//Fused Operations (better performance, fewer memory accesses) ---------------
-    Value linear(const Value& a, const Value& b, const Value& c){ 
-        return Value(ag::detail::linear_nodeops(a.node, b.node, c.node)); 
-    }
-    Value fmab(const Value& a, const Value& b, const Value& c){ 
-        return Value(ag::detail::fmab_nodeops(a.node, b.node, c.node)); 
-    }
-
-//Classification losses ---------------
-    Value cross_entropy_with_logits(const Value& logits, const Value& onehot){
-        return Value(ag::detail::cross_entropy_with_logits_nodeops(logits.node, onehot.node));
-    }
-    Value kldivergence(const Value& logits, const Value& onehot){
-        return Value(ag::detail::kldivergence_nodeops(logits.node, onehot.node));
-    }
-
-//Regression Losses --------------
-    Value mse_loss(const Value& pred, const Value& target) {
-        return Value(ag::detail::mse_loss_nodeops(pred.node, target.node));
-    }
-    Value mae_loss(const Value& pred, const Value& target) {
-        return Value(ag::detail::mae_loss_nodeops(pred.node, target.node));
-    }
-
-//Layer Normalization ------------
-    Value laynor(const Value& x){ 
-        return Value(ag::detail::laynor_nodeops(x.node));
-    }
-
 //RMS Normalization -------------
     Value rms(const Value& x){ 
         return Value(ag::detail::rms_nodeops(x.node));
@@ -341,7 +312,7 @@ Tensor forward_eval_node(const std::shared_ptr<Node> &node) {
         // }
         case Op::Tanh: {
             const Tensor &X = node->inputs[0]->value;
-            return tanh(X);
+            return trig::tanh(X);
         }
         case Op::Exp: {
             const Tensor &X = node->inputs[0]->value;
@@ -440,6 +411,50 @@ Tensor forward_eval_node(Node* node) {
  *      Tensor loss = mse(y, target);
  *      backward(loss);
  */
+
+
+    Value linear(const Value& a, const Value& b, const Value& c){
+        return Value(ag::detail::linear_nodeops(a.node, b.node, c.node));
+    }
+    Value fmab(const Value& a, const Value& b, const Value& c){
+        return Value(ag::detail::fmab_nodeops(a.node, b.node, c.node));
+    }
+    Value dropout(const Value& a, const Value& b){
+        return Value(ag::detail::dropout_nodeops(a.node, b.node));
+    }
+    Value flatten(const Value& a){
+        return Value(ag::detail::flatten_nodeops(a.node));
+    }
+
+    //Classification losses ---------------
+    Value cross_entropy_with_logits(const Value& logits, const Value& onehot){
+        return Value(ag::detail::cross_entropy_with_logits_nodeops(logits.node, onehot.node));
+    }
+    Value kldivergence(const Value& logits, const Value& onehot){
+        return Value(ag::detail::kldivergence_nodeops(logits.node, onehot.node));
+    }
+
+    //Regression Losses --------------
+    Value mse_loss(const Value& pred, const Value& target){
+        return Value(ag::detail::mse_loss_nodeops(pred.node, target.node));
+    }
+    Value mae_loss(const Value& pred, const Value& target){
+        return Value(ag::detail::mae_loss_nodeops(pred.node, target.node));
+    }
+    Value binary_cross_entropy(const Value& pred, const Value& target){
+        return Value(ag::detail::binary_cross_entropy_nodeops(pred.node, target.node));
+    }
+    Value categorical_cross_entropy(const Value& pred, const Value& target){
+        return Value(ag::detail::categorical_cross_entropy_nodeops(pred.node, target.node));
+    }
+
+    // Softmax alias
+    // Value softmax(const Value& x) { return softmax_row(x); }
+
+    // Layer Normalization ------------
+    Value laynor(const Value& x){
+        return Value(ag::detail::laynor_nodeops(x.node));
+    }
 
 
 } // namespace ag

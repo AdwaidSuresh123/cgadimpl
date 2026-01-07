@@ -7,8 +7,8 @@ set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA SMs" FORCE)
 
 project(cgadimpl LANGUAGES CXX CUDA)
 
-set(MLIR_DIR "/home/blubridge-029/Desktop/llvm-project/build/lib/cmake/mlir")
-set(mlir-compiler_DIR "/home/blubridge-029/Downloads/cgad/cgadimpl_/Nova-Compiler/install/lib/cmake/mlir-compiler")
+set(MLIR_DIR "/home/blubridge-038/Desktop/llvm-project/build/lib/cmake/mlir")
+set(mlir-compiler_DIR "/home/blubridge-038/Music/cgadimpl/Nova-Compiler/install/lib/cmake/mlir-compiler")
 
 # --- Compiler, CUDA, and OpenMP Setup ---
 find_package(CUDAToolkit REQUIRED)
@@ -179,6 +179,7 @@ if(true)
   add_ag_test(test_memory_                                    Tests/benchmark_memory_approaches.cpp )
   
   add_ag_test(test_autograd_hooks                             Tests/autograd_hooks_testing/test_hooks.cpp)
+  add_ag_test(test_register_ops                               Tests/test_register_ops.cpp)
  
   # Ops Tests
 #   add_ag_test(test_activation                  Tests/ops_test/test_activation.cpp)
