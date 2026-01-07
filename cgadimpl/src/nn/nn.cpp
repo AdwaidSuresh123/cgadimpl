@@ -5,11 +5,14 @@
 
 namespace ag::nn {
 
-void Module::to(Device dev) {
+void Module::to(DeviceIndex dev) {
     for (Value& p : params_) {
         if (p.node) {
             p.node->value = p.node->value.to(dev);
-            p.node->grad = OwnTensor::Tensor::zeros(p.node->value.shape(), ag::options(p.node->value));
+            auto grad_opts = OwnTensor::TensorOptions()  
+                .with_device(dev)  
+                .with_dtype(p.node->value.dtype());
+            p.node->grad = OwnTensor::Tensor::zeros(p.node->value.shape(), grad_opts);
         }
     }
 }
@@ -25,7 +28,7 @@ void Module::zero_grad() {
 Linear::Linear(int in_features, int out_features, Device dev) {
     float scale = sqrtf(2.0f / in_features);
     auto param_opts = OwnTensor::TensorOptions().with_device(dev).with_req_grad(true);
-    Tensor w_tensor = OwnTensor::Tensor::randn(Shape{{out_features, in_features}}, param_opts) * scale;
+    Tensor w_tensor = OwnTensor::Tensor::rand(Shape{{out_features, in_features}}, param_opts) * scale;
     Tensor b_tensor = OwnTensor::Tensor::zeros(Shape{{1, out_features}}, param_opts);
     W = make_tensor(w_tensor, "W");
     b = make_tensor(b_tensor, "b");
