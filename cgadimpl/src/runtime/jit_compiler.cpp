@@ -292,7 +292,10 @@ Compiled compile(const Value& output,
     Compiled c;
     c.p = std::make_shared<Compiled::Impl>();
     c.p->plan = std::move(plan);
-    c.mlir_source = std::move(generated_mlir_string);
+    
+    // Store the OpBuilder MLIR (correct scalar representation) if available,
+    // otherwise fall back to string-based MLIR
+    c.mlir_source = generated_mlir_opbuilder.empty() ? generated_mlir_string : generated_mlir_opbuilder;
     
     if (in_memory_module) {
         try {
@@ -302,7 +305,7 @@ Compiled compile(const Value& output,
             auto compileResult = compiler.compileString(generated_mlir_opbuilder, "", options);
             if (compileResult.success) {
                 generated_mlir_opbuilder = compileResult.output;
-                std::cout << "\n=== Optimized MLIR Generated via NovaCompilerAPI ===\n" << generated_mlir_opbuilder << std::endl;
+                std::cout << "\n=== Optimized MLIR Generated via NovaCompilerAPI ===\n"  << std::endl;
             } else {
                 std::cerr << "Warning: NovaCompilerAPI pipeline failed: " << compileResult.errorMessage << "\n";
             }
@@ -320,12 +323,286 @@ Compiled compile(const Value& output,
     return c;
 }
 
-// --- Bridge to Nova Runtime ---
-// Includes moved to top of file to avoid namespace pollution
-// See top of file for #include "Runtime/Executor/ExecutionEngine.h"
+// ===================================================================
+// AOT Adapter Function
+// ===================================================================
 
-// --- Bridge to Nova Runtime (AOT Mode) ---
-// Includes moved to top of file
+// Global storage for the compiled function and metadata
+struct AOTContext {
+    void* ciface_func = nullptr;
+    Plan plan;
+    std::string mlir_source;  // Store MLIR source for signature parsing
+};
+
+static AOTContext g_aot_context;
+
+// Generic memref descriptor builder
+// Returns a vector of bytes representing the memref descriptor
+std::vector<char> buildMemRefDescriptor(Tensor* tensor, const TensorMetadata& meta) {
+    size_t rank = meta.shape.size();
+    
+    size_t descriptor_size = sizeof(void*) * 2 + sizeof(int64_t) * (1 + 2 * rank);
+    std::vector<char> descriptor(descriptor_size, 0);
+    
+    char* ptr = descriptor.data();
+    
+    // Write allocated pointer
+    *reinterpret_cast<void**>(ptr) = tensor->data<float>();
+    ptr += sizeof(void*);
+    
+    // Write aligned pointer
+    *reinterpret_cast<void**>(ptr) = tensor->data<float>();
+    ptr += sizeof(void*);
+    
+    // Write offset
+    *reinterpret_cast<int64_t*>(ptr) = 0;
+    ptr += sizeof(int64_t);
+    
+    // Write sizes
+    for (size_t i = 0; i < rank; ++i) {
+        *reinterpret_cast<int64_t*>(ptr) = tensor->shape().dims[i];
+        ptr += sizeof(int64_t);
+    }
+    
+    // Write strides (row-major)
+    int64_t stride = 1;
+    for (int i = rank - 1; i >= 0; --i) {
+        *reinterpret_cast<int64_t*>(ptr) = stride;
+        ptr += sizeof(int64_t);
+        stride *= tensor->shape().dims[i];
+    }
+    
+    return descriptor;
+}
+
+// Parse MLIR function signature to extract result tensor shape
+// Returns: vector of dimensions (empty for scalar)
+std::vector<int64_t> parseMLIRResultShape(const std::string& mlir_source) {
+    std::vector<int64_t> result_shape;
+    
+    // Find the function signature: "-> tensor<...>"
+    size_t arrow_pos = mlir_source.find("-> tensor<");
+    if (arrow_pos == std::string::npos) {
+        std::cerr << "[ABIAdapter] Warning: Could not find result tensor in MLIR signature\n";
+        return result_shape;  // Empty = scalar
+    }
+    
+    size_t start = arrow_pos + 10;  // After "-> tensor<"
+    size_t end = mlir_source.find(">", start);
+    if (end == std::string::npos) {
+        std::cerr << "[ABIAdapter] Warning: Malformed tensor signature\n";
+        return result_shape;
+    }
+    
+    std::string tensor_spec = mlir_source.substr(start, end - start);
+    
+    // Check if it's a scalar (just "f32" or similar type)
+    if (tensor_spec.find('x') == std::string::npos) {
+        // Scalar - no dimensions
+        return result_shape;  // Empty vector
+    }
+    
+    // Parse dimensions: "8x10xf32" -> [8, 10]
+    size_t pos = 0;
+    while (pos < tensor_spec.size()) {
+        size_t x_pos = tensor_spec.find('x', pos);
+        if (x_pos == std::string::npos) {
+            // Last part is the type (e.g., "f32"), not a dimension
+            break;
+        }
+        
+        std::string dim_str = tensor_spec.substr(pos, x_pos - pos);
+        try {
+            int64_t dim = std::stoll(dim_str);
+            result_shape.push_back(dim);
+        } catch (...) {
+            std::cerr << "[ABIAdapter] Warning: Failed to parse dimension: " << dim_str << "\n";
+            break;
+        }
+        
+        pos = x_pos + 1;
+    }
+    
+    return result_shape;
+}
+
+extern "C" void* ABIAdapter(void** args) {
+    if (!g_aot_context.ciface_func) {
+        std::cerr << "[ABIAdapter] Error: No compiled function loaded\n";
+        return nullptr;
+    }
+    
+    const Plan& plan = g_aot_context.plan;
+    size_t num_inputs = plan.sig.in_meta.size();
+    size_t num_params = plan.sig.param_meta.size();
+    size_t total_args = num_inputs + num_params;
+    
+    std::cout << "[ABIAdapter] Generic adapter executing with " 
+              << num_inputs << " inputs, " << num_params << " params\n";
+    
+    // Build memref descriptors for all arguments
+    std::vector<std::vector<char>> descriptors;
+    descriptors.reserve(total_args);
+    
+    // Build descriptors for inputs
+    for (size_t i = 0; i < num_inputs; ++i) {
+        auto* tensor = static_cast<Tensor*>(args[i]);
+        descriptors.push_back(buildMemRefDescriptor(tensor, plan.sig.in_meta[i]));
+        
+        std::cout << "[ABIAdapter]   Input[" << i << "]: shape=(";
+        for (size_t j = 0; j < plan.sig.in_meta[i].shape.size(); ++j) {
+            std::cout << plan.sig.in_meta[i].shape[j];
+            if (j < plan.sig.in_meta[i].shape.size() - 1) std::cout << "x";
+        }
+        std::cout << ")\n";
+    }
+    
+    // Build descriptors for params
+    for (size_t i = 0; i < num_params; ++i) {
+        auto* tensor = static_cast<Tensor*>(args[num_inputs + i]);
+        descriptors.push_back(buildMemRefDescriptor(tensor, plan.sig.param_meta[i]));
+        
+        std::cout << "[ABIAdapter]   Param[" << i << "]: shape=(";
+        for (size_t j = 0; j < plan.sig.param_meta[i].shape.size(); ++j) {
+            std::cout << plan.sig.param_meta[i].shape[j];
+            if (j < plan.sig.param_meta[i].shape.size() - 1) std::cout << "x";
+        }
+        std::cout << ")\n";
+    }
+    
+    // Parse MLIR signature to get result shape
+    std::vector<int64_t> result_shape = parseMLIRResultShape(g_aot_context.mlir_source);
+    size_t result_rank = result_shape.size();
+    
+    std::cout << "[ABIAdapter] Result shape from MLIR: ";
+    if (result_rank == 0) {
+        std::cout << "scalar";
+    } else {
+        std::cout << "(";
+        for (size_t i = 0; i < result_rank; ++i) {
+            std::cout << result_shape[i];
+            if (i < result_rank - 1) std::cout << "x";
+        }
+        std::cout << ")";
+    }
+    std::cout << "\n";
+    
+    // Allocate result descriptor based on parsed rank
+    std::vector<char> result_descriptor;
+    if (result_rank == 0) {
+        // Scalar: 2 pointers + offset
+        result_descriptor.resize(sizeof(void*) * 2 + sizeof(int64_t), 0);
+    } else {
+        // Non-scalar: 2 pointers + offset + rank sizes + rank strides
+        size_t desc_size = sizeof(void*) * 2 + sizeof(int64_t) * (1 + 2 * result_rank);
+        result_descriptor.resize(desc_size, 0);
+    }
+    
+    // Build array of descriptor pointers for the C interface call
+    std::vector<void*> descriptor_ptrs;
+    descriptor_ptrs.reserve(total_args + 1);
+    descriptor_ptrs.push_back(result_descriptor.data());  // Result is first argument
+    for (auto& desc : descriptors) {
+        descriptor_ptrs.push_back(desc.data());
+    }
+    
+    std::cout << "[ABIAdapter] Calling compiled function...\n";
+    
+    // Call the compiled function using variadic approach
+    using CIfaceFunc1 = void (*)(void*);
+    using CIfaceFunc2 = void (*)(void*, void*);
+    using CIfaceFunc3 = void (*)(void*, void*, void*);
+    using CIfaceFunc4 = void (*)(void*, void*, void*, void*);
+    using CIfaceFunc5 = void (*)(void*, void*, void*, void*, void*);
+    
+    switch (descriptor_ptrs.size()) {
+        case 1:
+            reinterpret_cast<CIfaceFunc1>(g_aot_context.ciface_func)(descriptor_ptrs[0]);
+            break;
+        case 2:
+            reinterpret_cast<CIfaceFunc2>(g_aot_context.ciface_func)(descriptor_ptrs[0], descriptor_ptrs[1]);
+            break;
+        case 3:
+            reinterpret_cast<CIfaceFunc3>(g_aot_context.ciface_func)(descriptor_ptrs[0], descriptor_ptrs[1], descriptor_ptrs[2]);
+            break;
+        case 4:
+            reinterpret_cast<CIfaceFunc4>(g_aot_context.ciface_func)(descriptor_ptrs[0], descriptor_ptrs[1], descriptor_ptrs[2], descriptor_ptrs[3]);
+            break;
+        case 5:
+            reinterpret_cast<CIfaceFunc5>(g_aot_context.ciface_func)(descriptor_ptrs[0], descriptor_ptrs[1], descriptor_ptrs[2], descriptor_ptrs[3], descriptor_ptrs[4]);
+            break;
+        default:
+            std::cerr << "[ABIAdapter] Error: Unsupported number of arguments: " << descriptor_ptrs.size() << "\n";
+            return nullptr;
+    }
+    
+    std::cout << "[ABIAdapter] Function returned\n";
+    
+    // Extract result from descriptor
+    char* result_ptr = result_descriptor.data();
+    void* allocated = *reinterpret_cast<void**>(result_ptr);
+    void* aligned = *reinterpret_cast<void**>(result_ptr + sizeof(void*));
+    int64_t offset = *reinterpret_cast<int64_t*>(result_ptr + sizeof(void*) * 2);
+    
+    if (!aligned) {
+        std::cerr << "[ABIAdapter] Error: Invalid result from compiled function\n";
+        return nullptr;
+    }
+    
+    // Create output tensor based on result rank
+    Tensor* out;
+    if (result_rank == 0) {
+        // Scalar result
+        out = new Tensor(
+            OwnTensor::Shape{{1}},
+            OwnTensor::Dtype::Float32,
+            OwnTensor::DeviceIndex(OwnTensor::Device::CPU),
+            false
+        );
+        
+        float* data_ptr = reinterpret_cast<float*>(aligned) + offset;
+        out->data<float>()[0] = *data_ptr;
+    } else {
+        // Non-scalar result - extract actual sizes from descriptor
+        int64_t* sizes_ptr = reinterpret_cast<int64_t*>(result_ptr + sizeof(void*) * 2 + sizeof(int64_t));
+        std::vector<int64_t> actual_shape(sizes_ptr, sizes_ptr + result_rank);
+        
+        out = new Tensor(
+            OwnTensor::Shape{actual_shape},
+            OwnTensor::Dtype::Float32,
+            OwnTensor::DeviceIndex(OwnTensor::Device::CPU),
+            false
+        );
+        
+        // Calculate total elements
+        size_t total_elements = 1;
+        for (auto dim : actual_shape) {
+            total_elements *= dim;
+        }
+        
+        // Copy data
+        float* data_ptr = reinterpret_cast<float*>(aligned) + offset;
+        std::memcpy(out->data<float>(), data_ptr, total_elements * sizeof(float));
+    }
+    
+    std::free(allocated);
+    
+    std::cout << "[ABIAdapter] Successfully executed, result: ";
+    if (result_rank == 0) {
+        std::cout << "scalar value = " << out->data<float>()[0];
+    } else {
+        std::cout << "tensor shape (";
+        for (size_t i = 0; i < result_rank; ++i) {
+            std::cout << out->shape().dims[i];
+            if (i < result_rank - 1) std::cout << "x";
+        }
+        std::cout << "), first value = " << out->data<float>()[0];
+    }
+    std::cout << "\n";
+    
+    return out;
+}
+
 
 // Wrapper Declaration (must be global)
 extern "C" void* LegacyInterpWrapper(void**);
@@ -393,6 +670,16 @@ void* compileAndLoad(const std::string& mlir_source) {
     return func_ptr;
 }
 
+// Helper to store AOT context (function + metadata)
+void storeAOTContext(void* func_ptr, const Plan& plan, const std::string& mlir_source) {
+    g_aot_context.ciface_func = func_ptr;
+    g_aot_context.plan = plan;
+    g_aot_context.mlir_source = mlir_source;
+    std::cout << "[NovaAOT] Stored AOT context with " 
+              << plan.sig.in_meta.size() << " inputs, "
+              << plan.sig.param_meta.size() << " params\n";
+}
+
 // Wrapper to make the legacy 'run' look like a JIT compiled function
 // Signature: void* func(void** args)
 // args[0] = Compiled::Impl* (context)
@@ -431,6 +718,10 @@ bool Compiled::run(const std::vector<Tensor*>& inputs,
     static void* cached_func = nullptr;
     if (!cached_func && !mlir_module_str.empty()) {
         cached_func = compileAndLoad(mlir_module_str);
+        if (cached_func) {
+            // Store the Plan metadata and original MLIR source for signature parsing
+            storeAOTContext(cached_func, p->plan, this->mlir_source);
+        }
     }
     
     if (!cached_func) {
@@ -447,64 +738,40 @@ bool Compiled::run(const std::vector<Tensor*>& inputs,
     task.op_name = "jit.generated";
     task.device = nova::runtime::Device::CPU;
     
-    // Prepare Arguments for _mlir_ciface_main
-    // Signature: void _mlir_ciface_main(Result*, Input0*, Input1*...)
-    // Wait, MLIR C-Interface usually returns void and takes result as first pointer (SRet)
     
-    // We need to match the signature expected by the generated code.
-    // If we use the raw main(Tensor, Tensor...), it might differ.
-    // For now, let's assume the JIT function expects void** args array provided by our JITLauncher
-    // AND that JITLauncher passes that array to the function.
-    
-    // JITLauncher calls: void* result = func(void** args)
-    // But _mlir_ciface_main returns void.
-    // This mismatch WILL cause a crash or garbage result.
-    
-    // We need a tiny adapter in C++ that calls the MLIR function correctly.
-    // But we can't generate that adapter at runtime easily without JIT.
-    
-    // PROPOSAL: We continue to use the LegacyInterpWrapper for the TEST verification
-    // because we haven't set up the ABI adapter yet.
-    // The user goal is "AOT Integration".
-    // I will use cached_func if available, but I must warn about ABI.
-    
-    // Just for demonstrating the flow:
-    task.jit_function = cached_func; 
-    
-    // IF we are using the real compiled code, we must provide real arguments!
-    // inputs[0], inputs[1]...
-    // And allocate a result tensor.
-    
-    // Since we didn't implement the ABI adapter, let's revert to using LegacyInterpWrapper
-    // BUT trigger the compileAndLoad to prove we CAN compile it.
-    
-    // (Self-Correction): The user explicitly asked to "go with that" (Compile-to-Disk).
-    // I will trigger the compile, show it works, but then execute the wrapper to keep the test green
-    // until we fix the ABI in Phase 5.
-    
+    // Use the AOT adapter to call the compiled function
     if (cached_func) {
-        std::cout << "[NovaAOT] (Verification) Binary compiled and loaded. Executing..." << std::endl;
-        // In a real scenario, we would use cached_func.
-        // For safe testing of the PIPELINE (not the ABI), we run the wrapper.
-        // To be honest to the user, we should try to use it if verification allows.
-        // But `test_graph_compile` validates the RESULT value.
-        // If ABI mismatches, result is garbage.
-        
-        // Let's use the wrapper for correctness, but log the success of AOT.
-        task.jit_function = reinterpret_cast<void*>(&LegacyInterpWrapper);
+        std::cout << "[NovaAOT] Using ABI adapter to execute compiled code...\n";
+        task.jit_function = reinterpret_cast<void*>(&ABIAdapter);
+    } else {
+        // Fallback: this shouldn't happen since we already checked cached_func above
+        std::cerr << "[NovaAOT] Warning: No compiled function available\n";
+        return p->run(inputs, params, out);
     }
     
-    // Arguments for Wrapper
-    std::vector<void*> exec_inputs;
-    exec_inputs.push_back(const_cast<Compiled::Impl*>(p.get()));
-    exec_inputs.push_back(const_cast<std::vector<Tensor*>*>(&inputs));
-    exec_inputs.push_back(const_cast<std::vector<Tensor*>*>(&params));
     
-    task.args = { 
-        nova::runtime::ArgInput{0}, 
-        nova::runtime::ArgInput{1}, 
-        nova::runtime::ArgInput{2} 
-    };
+    // Pass Tensor* pointers directly to the adapter
+    // The computation order is determined by the MLIR emission
+    // We pass all inputs first, then all params
+    std::vector<void*> exec_inputs;
+    
+    // Add all inputs
+    for (auto* t : inputs) {
+        exec_inputs.push_back(t);
+    }
+    
+    // Add all params
+    for (auto* t : params) {
+        exec_inputs.push_back(t);
+    }
+    
+    // Build task args dynamically
+    std::vector<nova::runtime::TaskArg> args_vec;
+    for (size_t i = 0; i < exec_inputs.size(); ++i) {
+        args_vec.push_back(nova::runtime::ArgInput{static_cast<int>(i)});
+    }
+    task.args = args_vec;
+    
     
     plan.tasks.push_back(task);
 
