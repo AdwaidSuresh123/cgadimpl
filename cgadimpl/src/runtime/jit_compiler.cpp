@@ -704,17 +704,7 @@ bool Compiled::run(const std::vector<Tensor*>& inputs,
                    const std::vector<Tensor*>& params,
                    Tensor& out) const {
     
-    // 1. Setup Runtime Engine
-    // In a real app, HostContext should be a global singleton or passed in.
-    static nova::runtime::HostContext host(4); 
-    nova::runtime::ExecutionEngine engine(&host);
-
-    // 2. Get the JIT Function (Compile if not already compiled)
-    // In a real implementation, we would cache 'jit_func_ptr' inside 'Compiled' class
-    // For now, we compile every time (or simplistic static cache if we could)
-    // But 'Compiled' object persists, so let's cache it there.
-    // However, Compiled::run is const. We need mutable cache or const_cast.
-    
+    // 1. Compile and load the AOT function (cached)
     static void* cached_func = nullptr;
     if (!cached_func && !mlir_module_str.empty()) {
         cached_func = compileAndLoad(mlir_module_str);
@@ -725,75 +715,33 @@ bool Compiled::run(const std::vector<Tensor*>& inputs,
     }
     
     if (!cached_func) {
-        // Fallback to legacy behavior if compilation fails
-         return p->run(inputs, params, out);
-    }
-
-    // 3. Build Execution Plan
-    nova::runtime::RuntimeExecutionPlan plan;
-    plan.output_task_id = 0;
-
-    nova::runtime::AsyncTask task;
-    task.task_id = 0;
-    task.op_name = "jit.generated";
-    task.device = nova::runtime::Device::CPU;
-    
-    
-    // Use the AOT adapter to call the compiled function
-    if (cached_func) {
-        std::cout << "[NovaAOT] Using ABI adapter to execute compiled code...\n";
-        task.jit_function = reinterpret_cast<void*>(&ABIAdapter);
-    } else {
-        // Fallback: this shouldn't happen since we already checked cached_func above
-        std::cerr << "[NovaAOT] Warning: No compiled function available\n";
+        // Fallback to legacy interpreter if compilation fails
         return p->run(inputs, params, out);
     }
+
+    // 2. Call the compiled function directly via ABI adapter
+    std::cout << "[NovaAOT] Using ABI adapter to execute compiled code...\n";
     
-    
-    // Pass Tensor* pointers directly to the adapter
-    // The computation order is determined by the MLIR emission
-    // We pass all inputs first, then all params
+    // Prepare arguments: all inputs first, then all params
     std::vector<void*> exec_inputs;
-    
-    // Add all inputs
     for (auto* t : inputs) {
         exec_inputs.push_back(t);
     }
-    
-    // Add all params
     for (auto* t : params) {
         exec_inputs.push_back(t);
     }
     
-    // Build task args dynamically
-    std::vector<nova::runtime::TaskArg> args_vec;
-    for (size_t i = 0; i < exec_inputs.size(); ++i) {
-        args_vec.push_back(nova::runtime::ArgInput{static_cast<int>(i)});
-    }
-    task.args = args_vec;
+    // Call the ABI adapter directly 
+    Tensor* result_tensor = static_cast<Tensor*>(ABIAdapter(exec_inputs.data()));
     
-    
-    plan.tasks.push_back(task);
-
-    // 4. Execute
-    // std::cout << "\n[NovaRuntime] Dispatching execution via ExecutionEngine..." << std::endl;
-    auto* result_av = engine.Execute(plan, exec_inputs, {});
-    result_av->Await();
-
-    // 5. Retrieve Result
-    if (result_av->IsError()) {
-        std::cerr << "Runtime Integration Error: " << result_av->GetError() << "\n";
+    if (!result_tensor) {
+        std::cerr << "[NovaAOT] Error: ABI adapter returned null\n";
         return false;
     }
 
-    auto* concrete = dynamic_cast<nova::runtime::ConcreteAsyncValue<void*>*>(result_av);
-    if (!concrete) return false;
-    
-    Tensor* result_tensor = static_cast<Tensor*>(concrete->get());
-    if (!result_tensor) return false;
-
+    // Move result to output
     out = std::move(*result_tensor);
-    delete result_tensor; 
+    delete result_tensor;
     return true;
 }
 
