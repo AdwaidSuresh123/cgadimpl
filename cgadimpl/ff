@@ -154,6 +154,7 @@ if(true)
   function(add_ag_test name src)
     add_executable(${name} ${src})
     target_link_libraries(${name} PRIVATE cgadimpl::cgadimpl CUDA::cudart OpenMP::OpenMP_CXX)
+    set_target_properties(${name} PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
     add_test(NAME ${name} COMMAND ${name})
   endfunction()
   
