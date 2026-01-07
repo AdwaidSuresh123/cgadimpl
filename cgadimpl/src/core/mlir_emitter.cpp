@@ -80,7 +80,9 @@ MLIREmitter::emitModule(const Plan& plan) {
     auto output_shape = output_meta.shape;
     
     // Total reduction rank adjustment: if it's a total reduction (Sum/MeanAll), it returns rank 0
-    if ((plan.steps.back().op == Op::Sum || plan.steps.back().op == Op::MeanAll) && 
+    if ((plan.steps.back().op == Op::Sum || plan.steps.back().op == Op::MeanAll ||
+         plan.steps.back().op == Op::MSELoss || plan.steps.back().op == Op::MAELoss ||
+         plan.steps.back().op == Op::BinaryCrossEntropy || plan.steps.back().op == Op::CategoricalCrossEntropy) && 
         output_shape.size() == 1 && output_shape[0] == 1) {
         output_shape = {};
     }
@@ -282,6 +284,38 @@ MLIREmitter::emitModule(const Plan& plan) {
                         /*keepdims=*/false,
                         llvm::ArrayRef<int64_t>{},
                         /*ignore_nan=*/false
+                    ).getResult();
+                }
+                break;
+
+            case Op::MSELoss:
+                if (operands.size() == 2) {
+                    result = builder.create<mlir::nova::MseOp>(
+                        loc, resultType, operands[0], operands[1]
+                    ).getResult();
+                }
+                break;
+
+            case Op::MAELoss:
+                if (operands.size() == 2) {
+                    result = builder.create<mlir::nova::MaeOp>(
+                        loc, resultType, operands[0], operands[1]
+                    ).getResult();
+                }
+                break;
+
+            case Op::BinaryCrossEntropy:
+                if (operands.size() == 2) {
+                    result = builder.create<mlir::nova::BceOp>(
+                        loc, resultType, operands[0], operands[1]
+                    ).getResult();
+                }
+                break;
+
+            case Op::CategoricalCrossEntropy:
+                if (operands.size() == 2) {
+                    result = builder.create<mlir::nova::CceOp>(
+                        loc, resultType, operands[0], operands[1]
                     ).getResult();
                 }
                 break;

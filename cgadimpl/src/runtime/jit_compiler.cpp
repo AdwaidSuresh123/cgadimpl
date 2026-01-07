@@ -59,6 +59,19 @@ struct Compiled::Impl {
             case Op::RowMax: return OwnTensor::reduce_max(*a[0], {1}, true);
             case Op::MeanAll: return OwnTensor::reduce_mean(*a[0]);
 
+            case Op::MSELoss: {
+                Tensor diff = *a[0] - *a[1];
+                return OwnTensor::reduce_mean(diff * diff);
+            }
+            case Op::MAELoss: {
+                cudaStream_t stream = (cudaStream_t)ag::current_stream();
+                return OwnTensor::reduce_mean(OwnTensor::abs(*a[0] - *a[1], stream));
+            }
+            case Op::BinaryCrossEntropy:
+                return OwnTensor::mlp_forward::binary_cross_entropy(*a[0], *a[1]);
+            case Op::CategoricalCrossEntropy:
+                return OwnTensor::mlp_forward::categorical_cross_entropy(*a[0], *a[1]);
+
             case Op::Leaf: default: {
                 // Shouldn't get called for Leaf
                 assert(false && "apply(): unexpected op");
@@ -133,6 +146,10 @@ static std::string opToNovaOp(Op op) {
         case Op::MatMul:    return "nova.matmul"; 
         case Op::Sum:       return "nova.reduce<sum>";
         case Op::MeanAll:   return "nova.reduce<mean>";
+        case Op::MSELoss:                return "nova.mse";
+        case Op::MAELoss:                return "nova.mae";
+        case Op::BinaryCrossEntropy:     return "nova.bce";
+        case Op::CategoricalCrossEntropy: return "nova.cce";
         default:            return "nova.unknown_op";
     }
 }
@@ -206,7 +223,9 @@ static std::string emitMLIR(const Plan& plan) {
     const auto& return_meta = plan.steps.back().out_meta;
     auto return_shape = return_meta.shape;
     
-    if ((plan.steps.back().op == Op::Sum || plan.steps.back().op == Op::MeanAll) && 
+    if ((plan.steps.back().op == Op::Sum || plan.steps.back().op == Op::MeanAll ||
+         plan.steps.back().op == Op::MSELoss || plan.steps.back().op == Op::MAELoss ||
+         plan.steps.back().op == Op::BinaryCrossEntropy || plan.steps.back().op == Op::CategoricalCrossEntropy) && 
         return_shape.size() == 1 && return_shape[0] == 1) {
         return_shape = {};
     }
