@@ -130,6 +130,7 @@ target_link_libraries(cgadimpl PUBLIC
     MLIRLLVMDialect
     MLIRUBDialect
     MLIRVectorDialect
+    MLIRVectorToLLVMPass
     
     # Core Infrastructure
     MLIRIR
