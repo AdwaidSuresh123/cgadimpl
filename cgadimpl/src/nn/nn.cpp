@@ -5,7 +5,7 @@
 
 namespace ag::nn {
 
-void Module::to(Device dev) {
+void Module::to(DeviceIndex dev) {
     for (Value& p : params_) {
         if (p.node) {
             p.node->value = p.node->value.to(dev);
