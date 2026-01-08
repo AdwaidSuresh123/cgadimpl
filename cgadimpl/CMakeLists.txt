@@ -9,6 +9,10 @@ project(cgadimpl LANGUAGES C CXX CUDA)
 find_package(CUDAToolkit REQUIRED)
 find_package(OpenMP REQUIRED)
 
+# --- libffi Setup (for dynamic ABI calls) ---
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFI REQUIRED libffi)
+
 # --- MLIR Setup ---
 find_package(MLIR REQUIRED CONFIG)
 find_package(mlir-compiler REQUIRED CONFIG)
@@ -76,6 +80,7 @@ target_include_directories(cgadimpl PUBLIC
     ${LLVM_INCLUDE_DIRS}
     ${MLIR_INCLUDE_DIRS}
     ${NOVA_INCLUDE_DIRS}
+    ${FFI_INCLUDE_DIRS}
     # Manual Include for Runtime (since not installed yet)
     ${CMAKE_CURRENT_SOURCE_DIR}/../Nova-Compiler/include
 )
@@ -86,6 +91,7 @@ set_target_properties(cgadimpl PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
 target_link_libraries(cgadimpl PUBLIC 
     OwnTensor::tensor 
     dl
+    ${FFI_LIBRARIES}
     
     # Nova libraries (higher level first)
     MlirCompiler::NovaCompilerAPI
@@ -168,6 +174,9 @@ if(true)
 #   add_ag_test(test_bench_relu                                 Tests/bench_relu.cpp)
   add_ag_test(test_tiny_handcalc                              Tests/tiny_handcalc.cpp)
   add_ag_test(test_graph_compile                              Tests/test_graph_compile.cpp)
+  add_ag_test(test_abi_comprehensive                          Tests/test_abi_comprehensive.cpp)
+  add_ag_test(test_deep_mlp                                   Tests/test_deep_mlp.cpp)
+  add_ag_test(test_multidim_tensors                           Tests/test_multidim_tensors.cpp)
   add_ag_test(ag_core_test                                    Tests/test.cpp)
   # add_ag_test(test_checkpoint                                 Tests/test_checkpoint.cpp)
   add_ag_test(test_inplace                                    Tests/test_inplace.cpp)
