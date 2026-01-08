@@ -22,6 +22,10 @@ struct Compiled {
     std::shared_ptr<void> mlir_module;
     std::string mlir_module_str;
     
+    // AOT compiled function data (populated during compile())
+    void* compiled_func = nullptr;      // Function pointer to _mlir_ciface_main
+    void* dl_handle = nullptr;          // Handle from dlopen (for cleanup)
+    
     // Execute the compiled plan
     bool run(const std::vector<Tensor*>& inputs,
              const std::vector<Tensor*>& params,

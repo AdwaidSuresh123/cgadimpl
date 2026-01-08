@@ -224,6 +224,10 @@ static std::string emitMLIR(const Plan& plan) {
     return ss.str();
 }
 
+// Forward declarations for AOT compilation helpers
+void* compileAndLoad(const std::string& mlir_source);
+void storeAOTContext(void* func_ptr, const Plan& plan, const std::string& mlir_source);
+
 Compiled compile(const Value& output,
                  const std::vector<Value>& inputs,
                  const std::vector<Value>& params,
@@ -320,6 +324,24 @@ Compiled compile(const Value& output,
     }
 
     c.mlir_module_str = std::move(generated_mlir_opbuilder);
+    
+    // ===================================================================
+    // NEW: Perform AOT Compilation Immediately (Eager Compilation)
+    // ===================================================================
+    if (!c.mlir_source.empty()) {
+        std::cout << "\n[Compile] Starting AOT compilation...\n";
+        void* func_ptr = compileAndLoad(c.mlir_source);
+        
+        if (func_ptr) {
+            c.compiled_func = func_ptr;
+            // Store the Plan metadata and original MLIR source for signature parsing
+            storeAOTContext(func_ptr, c.p->plan, c.mlir_source);
+            std::cout << "[Compile] AOT compilation successful! Function ready at " << func_ptr << "\n";
+        } else {
+            std::cerr << "[Compile] Warning: AOT compilation failed. Will fall back to interpreter.\n";
+        }
+    }
+    
     return c;
 }
 
@@ -704,23 +726,15 @@ bool Compiled::run(const std::vector<Tensor*>& inputs,
                    const std::vector<Tensor*>& params,
                    Tensor& out) const {
     
-    // 1. Compile and load the AOT function (cached)
-    static void* cached_func = nullptr;
-    if (!cached_func && !mlir_module_str.empty()) {
-        cached_func = compileAndLoad(mlir_module_str);
-        if (cached_func) {
-            // Store the Plan metadata and original MLIR source for signature parsing
-            storeAOTContext(cached_func, p->plan, this->mlir_source);
-        }
-    }
-    
-    if (!cached_func) {
-        // Fallback to legacy interpreter if compilation fails
+    // Check if we have a pre-compiled function from compile()
+    if (!compiled_func) {
+        // Fallback to interpreter if compilation failed or wasn't attempted
+        std::cout << "[Run] No compiled function available, using interpreter...\n";
         return p->run(inputs, params, out);
     }
 
-    // 2. Call the compiled function directly via ABI adapter
-    std::cout << "[NovaAOT] Using ABI adapter to execute compiled code...\n";
+    // Execute the pre-compiled function via ABI adapter
+    std::cout << "[Run] Executing pre-compiled function...\n";
     
     // Prepare arguments: all inputs first, then all params
     std::vector<void*> exec_inputs;
@@ -735,7 +749,7 @@ bool Compiled::run(const std::vector<Tensor*>& inputs,
     Tensor* result_tensor = static_cast<Tensor*>(ABIAdapter(exec_inputs.data()));
     
     if (!result_tensor) {
-        std::cerr << "[NovaAOT] Error: ABI adapter returned null\n";
+        std::cerr << "[Run] Error: ABI adapter returned null\n";
         return false;
     }
 
