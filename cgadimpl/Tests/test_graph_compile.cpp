@@ -23,13 +23,17 @@ int main() {
     auto opts_param = TensorOptions().with_req_grad(true);
     auto W1 = make_tensor(Tensor::randn<float>(Shape{{In, Out}}, opts_param), "W1");
     auto b1 = make_tensor(Tensor::zeros(Shape{{1, Out}}, opts_param), "b1");
+    
+    // Target for Sparse CE must be 1D integer indices [Batch]
+    auto target = make_tensor(Tensor::zeros(Shape{{B}}, TensorOptions().with_dtype(OwnTensor::Dtype::Int32)), "target");
 
     // ---------- Forward Pass (using only JIT-supported ops) ----------
     // A simple linear layer: Z = X @ W1 + b1
     Value Z = matmul(X, W1) + b1;
 
+
     // To create a scalar loss, we can sum all elements of Z
-    Value loss = sum(Z);
+    Value loss = sparse_cross_entropy_with_logits(Z, target);
     
     std::cout << "Eager forward pass completed.\n";
     debug::print_value("Eager Loss", loss);
@@ -39,7 +43,7 @@ int main() {
 
     // Tell the compiler which leaves are runtime inputs vs. trainable parameters
     std::vector<Value> inputs = {X};
-    std::vector<Value> params = {W1, b1};
+    std::vector<Value> params = {W1, b1,target};
 
     // The 'loss' Value is the root of the graph to be compiled
     auto comp = ag::jit::compile(loss, inputs, params);
@@ -51,7 +55,7 @@ int main() {
 
     // Prepare raw tensor pointers for the run() method
     std::vector<Tensor*> in_ptrs = {&X.node->value};
-    std::vector<Tensor*> par_ptrs = {&W1.node->value, &b1.node->value};
+    std::vector<Tensor*> par_ptrs = {&W1.node->value, &b1.node->value, &target.node->value};
 
     Tensor compiled_out; // This will receive the output
     bool ok = comp.run(in_ptrs, par_ptrs, compiled_out);

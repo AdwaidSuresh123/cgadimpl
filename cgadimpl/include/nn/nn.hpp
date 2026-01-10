@@ -18,7 +18,7 @@ public:
 
     std::vector<Value>& parameters() { return params_; }
 
-    void to(Device dev);
+    void to(DeviceIndex dev);
     void zero_grad();
     void register_backward_hook(HookFn hook) {
         for (auto& p : params_) {

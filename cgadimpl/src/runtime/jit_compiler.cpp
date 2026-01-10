@@ -9,6 +9,8 @@
 #include <iostream>
 #include <cassert>
 #include <sstream>
+#include "ad/ag_all.hpp"
+#include "ad/ops/ops.hpp"
 
 namespace ag::jit {
 
@@ -71,7 +73,42 @@ struct Compiled::Impl {
                 return OwnTensor::mlp_forward::binary_cross_entropy(*a[0], *a[1]);
             case Op::CategoricalCrossEntropy:
                 return OwnTensor::mlp_forward::categorical_cross_entropy(*a[0], *a[1]);
-
+            case Op::CeWithLogits:
+            {
+                const Tensor& Z = *a[0];
+                const Tensor& Y = *a[1];
+                Tensor max_val = OwnTensor::reduce_max(Z, {-1}, true);
+                Tensor z_shifted = Z - max_val;
+                Tensor log_sum_exp = OwnTensor::log(OwnTensor::reduce_sum(OwnTensor::exp(z_shifted, ag::current_stream()), {-1}, true), ag::current_stream());
+                Tensor log_sm = z_shifted - log_sum_exp;
+                Tensor prod = Y * log_sm;
+                Tensor sum_prod = OwnTensor::reduce_sum(prod, {-1}); 
+                return OwnTensor::reduce_mean(sum_prod * -1.0f); 
+            }
+            case Op::KLDivergence:
+            {
+                const Tensor& Z = *a[0];
+                const Tensor& Y = *a[1];
+                Tensor log_Y = OwnTensor::log(Y + 1e-9f, ag::current_stream());
+                Tensor max_val = OwnTensor::reduce_max(Z, {-1}, true);
+                Tensor z_shifted = Z - max_val;
+                Tensor log_sum_exp = OwnTensor::log(OwnTensor::reduce_sum(OwnTensor::exp(z_shifted, ag::current_stream()), {-1}, true), ag::current_stream());
+                Tensor log_sm_Z = z_shifted - log_sum_exp;
+                Tensor kl_div_elementwise = Y * (log_Y - log_sm_Z);
+                Tensor sum_kl = OwnTensor::reduce_sum(kl_div_elementwise, {-1});
+                return OwnTensor::reduce_mean(sum_kl);
+            }
+            case Op::SparseCeWithLogits:
+            {
+                const Tensor& Z = *a[0];
+                const Tensor& Y = *a[1];
+                Tensor max_val = OwnTensor::reduce_max(Z, {-1}, true);
+                Tensor z_shifted = Z - max_val;
+                Tensor log_sum_exp = OwnTensor::log(OwnTensor::reduce_sum(OwnTensor::exp(z_shifted, ag::current_stream()), {-1}, true), ag::current_stream());
+                Tensor log_sm_Z = z_shifted - log_sum_exp;
+                Tensor selected_log_probs = OwnTensor::gather(log_sm_Z, 1, Y);
+                return OwnTensor::reduce_mean(selected_log_probs * -1.0f);
+            }
             case Op::Leaf: default: {
                 // Shouldn't get called for Leaf
                 assert(false && "apply(): unexpected op");
@@ -150,6 +187,10 @@ static std::string opToNovaOp(Op op) {
         case Op::MAELoss:                return "nova.mae";
         case Op::BinaryCrossEntropy:     return "nova.bce";
         case Op::CategoricalCrossEntropy: return "nova.cce";
+        case Op::CeWithLogits:           return "nova.ce_with_logits";
+        case Op::KLDivergence:           return "nova.kldivergence";
+        case Op::SparseCeWithLogits:     return "nova.sce";
+
         default:            return "nova.unknown_op";
     }
 }

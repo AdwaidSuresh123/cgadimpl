@@ -9,6 +9,10 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/Support/raw_ostream.h"
 #include <sstream>
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/MLIRContext.h"
+#include "Compiler/Dialect/nova/NovaDialect.h"
+#include "Compiler/Dialect/nova/NovaOps.h"
 
 namespace ag::jit {
 
@@ -42,11 +46,31 @@ mlir::Type MLIREmitter::dtypeToMLIRType(mlir::OpBuilder& builder, OwnTensor::Dty
 mlir::RankedTensorType MLIREmitter::createTensorType(
     mlir::OpBuilder& builder,
     const std::vector<int64_t>& shape,
-    OwnTensor::Dtype dtype
+    OwnTensor::Dtype dtype,
+    OwnTensor::DeviceIndex device
 ) {
     auto elemType = dtypeToMLIRType(builder, dtype);
-    return mlir::RankedTensorType::get(shape, elemType);
+    
+    std::string deviceStr = device.is_cuda() ? "1" : "0";
+    
+    auto deviceAttr = ::mlir::nova::NovaDeviceAttr::get(
+        builder.getContext(), 
+        builder.getStringAttr(deviceStr)
+    );
+
+    return mlir::RankedTensorType::get(shape, elemType, deviceAttr);
 }
+// mlir::RankedTensorType MLIREmitter::createTensorType1(
+//     mlir::OpBuilder& builder,
+//     const std::vector<int64_t>& shape,
+//     OwnTensor::Dtype dtype, 
+//     mlir::nova::NovaDeviceAttr device
+// ) {
+//     auto elemType = dtypeToMLIRType(builder, dtype);
+//     return  mlir::RankedTensorType::get(
+//       shape, elemType,
+//       NovaDeviceAttr::get(builder.getContext(), builder.getStringAttr(device)));
+// }
 
 std::pair<mlir::OwningOpRef<mlir::ModuleOp>, std::string> 
 MLIREmitter::emitModule(const Plan& plan) {
@@ -62,12 +86,12 @@ MLIREmitter::emitModule(const Plan& plan) {
     
     // Add input tensors to function signature
     for (const auto& meta : plan.sig.in_meta) {
-        inputTypes.push_back(createTensorType(builder, meta.shape, meta.dtype));
+        inputTypes.push_back(createTensorType(builder, meta.shape, meta.dtype, meta.device));
     }
     
     // Add parameter tensors to function signature
     for (const auto& meta : plan.sig.param_meta) {
-        inputTypes.push_back(createTensorType(builder, meta.shape, meta.dtype));
+        inputTypes.push_back(createTensorType(builder, meta.shape, meta.dtype, meta.device));
     }
 
     // Output type comes from the last step
@@ -82,12 +106,14 @@ MLIREmitter::emitModule(const Plan& plan) {
     // Total reduction rank adjustment: if it's a total reduction (Sum/MeanAll), it returns rank 0
     if ((plan.steps.back().op == Op::Sum || plan.steps.back().op == Op::MeanAll ||
          plan.steps.back().op == Op::MSELoss || plan.steps.back().op == Op::MAELoss ||
-         plan.steps.back().op == Op::BinaryCrossEntropy || plan.steps.back().op == Op::CategoricalCrossEntropy) && 
+         plan.steps.back().op == Op::BinaryCrossEntropy || plan.steps.back().op == Op::CategoricalCrossEntropy ||
+         plan.steps.back().op == Op::SparseCeWithLogits || plan.steps.back().op == Op::CeWithLogits ||
+         plan.steps.back().op == Op::KLDivergence) && 
         output_shape.size() == 1 && output_shape[0] == 1) {
         output_shape = {};
     }
     
-    auto outputType = createTensorType(builder, output_shape, output_meta.dtype);
+    auto outputType = createTensorType(builder, output_shape, output_meta.dtype, output_meta.device);
 
     // Create function type
     auto funcType = builder.getFunctionType(inputTypes, outputType);
@@ -129,7 +155,7 @@ MLIREmitter::emitModule(const Plan& plan) {
                 // For literals, we create a nova.constant op
                 const auto& t = a.t;
                 auto shape = t.shape().dims;
-                auto type = createTensorType(builder, shape, t.dtype());
+                auto type = createTensorType(builder, shape, t.dtype(), t.device());
                 
                 // For now, support float32 literals
                 if (t.dtype() == OwnTensor::Dtype::Float32) {
@@ -160,7 +186,7 @@ MLIREmitter::emitModule(const Plan& plan) {
 
         // Create the appropriate Nova operation
         mlir::Value result;
-        auto resultType = createTensorType(builder, step.out_meta.shape, step.out_meta.dtype);
+        auto resultType = createTensorType(builder, step.out_meta.shape, step.out_meta.dtype, step.out_meta.device);
 
         switch (step.op) {
             case Op::Add:
@@ -230,7 +256,7 @@ MLIREmitter::emitModule(const Plan& plan) {
             case Op::Sum:
                 if (operands.size() == 1) {
                     // Sum all dimensions - Nova expects rank-0 for total reduction if keepdims=false
-                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType());
+                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
                     result = builder.create<mlir::nova::ReduceOp>(
                         loc,
                         mlir::nova::ReductionKind::SUM,
@@ -275,7 +301,7 @@ MLIREmitter::emitModule(const Plan& plan) {
 
             case Op::MeanAll:
                 if (operands.size() == 1) {
-                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType());
+                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
                     result = builder.create<mlir::nova::ReduceOp>(
                         loc,
                         mlir::nova::ReductionKind::MEAN,
@@ -290,32 +316,55 @@ MLIREmitter::emitModule(const Plan& plan) {
 
             case Op::MSELoss:
                 if (operands.size() == 2) {
+                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
                     result = builder.create<mlir::nova::MseOp>(
-                        loc, resultType, operands[0], operands[1]
+                        loc, scalarType, operands[0], operands[1]
                     ).getResult();
                 }
                 break;
 
             case Op::MAELoss:
                 if (operands.size() == 2) {
+                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
                     result = builder.create<mlir::nova::MaeOp>(
-                        loc, resultType, operands[0], operands[1]
+                        loc, scalarType, operands[0], operands[1]
                     ).getResult();
                 }
                 break;
 
             case Op::BinaryCrossEntropy:
                 if (operands.size() == 2) {
+                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
                     result = builder.create<mlir::nova::BceOp>(
-                        loc, resultType, operands[0], operands[1]
+                        loc, scalarType, operands[0], operands[1]
                     ).getResult();
                 }
                 break;
 
             case Op::CategoricalCrossEntropy:
                 if (operands.size() == 2) {
+                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
                     result = builder.create<mlir::nova::CceOp>(
-                        loc, resultType, operands[0], operands[1]
+                        loc, scalarType, operands[0], operands[1]
+                    ).getResult();
+                }
+                break;
+
+            case Op::CeWithLogits:
+                llvm::errs() << "Warning: CeWithLogits not yet supported in MLIR emitter\n";
+                return {mlir::OwningOpRef<mlir::ModuleOp>(module), ""};
+                break;
+
+            case Op::KLDivergence:
+                llvm::errs() << "Warning: KLDivergence not yet supported in MLIR emitter\n";
+                return {mlir::OwningOpRef<mlir::ModuleOp>(module), ""};
+                break;
+
+            case Op::SparseCeWithLogits:
+                if (operands.size() == 2) {
+                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
+                    result = builder.create<mlir::nova::SceOp>(
+                        loc, scalarType, operands[0], operands[1]
                     ).getResult();
                 }
                 break;

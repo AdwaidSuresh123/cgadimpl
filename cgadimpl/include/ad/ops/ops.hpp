@@ -73,6 +73,7 @@ Value flatten(const Value& a);
 //Classification losses ---------------
 Value cross_entropy_with_logits(const Value& logits, const Value& onehot);
 Value kldivergence(const Value& logits, const Value& onehot);
+Value sparse_cross_entropy_with_logits(const Value& logits, const Value& target);
 
 //Regression Losses --------------
 Value mse_loss(const Value& pred, const Value& target);

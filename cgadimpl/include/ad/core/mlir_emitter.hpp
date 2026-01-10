@@ -109,7 +109,8 @@ private:
     mlir::RankedTensorType createTensorType(
         mlir::OpBuilder& builder,
         const std::vector<int64_t>& shape,
-        OwnTensor::Dtype dtype
+        OwnTensor::Dtype dtype,
+        OwnTensor::DeviceIndex device = {}
     );
 
     /// Register required dialects

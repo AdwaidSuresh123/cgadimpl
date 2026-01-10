@@ -87,6 +87,7 @@ std::shared_ptr<Node> swiglu_nodeops(const std::shared_ptr<Node>& x, const std::
 // Classification loss ----------------
 std::shared_ptr<Node> cross_entropy_with_logits_nodeops(const std::shared_ptr<Node>& logits, const std::shared_ptr<Node>& onehot);
 std::shared_ptr<Node> kldivergence_nodeops(const std::shared_ptr<Node>& logits,const std::shared_ptr<Node>& onehot);
+std::shared_ptr<Node> sparse_cross_entropy_with_logits_nodeops(const std::shared_ptr<Node>& logits, const std::shared_ptr<Node>& target);
 
 // Regression loss --------------- 
 std::shared_ptr<Node> mse_loss_nodeops( const std::shared_ptr<Node>& pred, const std::shared_ptr<Node>& target);

@@ -350,6 +350,37 @@ void vjp_KLDivergence(Node* n, const Tensor& gy){
     }
 }
 
+void vjp_SparseCeWithLogits(Node* n, const Tensor& gy){
+    Node* Z_node = n->inputs[0].get();
+    // We do not compute gradients for the integer target indices (inputs[1])
+
+    if (Z_node->requires_grad()) {
+        Tensor Z = n->inputs[0]->value;      // Logits [Batch, NumClasses]
+        Tensor Target = n->inputs[1]->value; // Indices [Batch]
+
+        // 1. Recompute Softmax (Identical to standard CE)
+        Tensor max_val = OwnTensor::reduce_max(Z, {-1}, true);
+        Tensor z_shifted = Z - max_val;
+        Tensor exp_z = OwnTensor::exp(z_shifted, ag::current_stream());
+        Tensor sum_exp_z = OwnTensor::reduce_sum(exp_z, {-1}, true);
+        Tensor softmax_z = exp_z / sum_exp_z;
+
+        // 3. Compute Gradient
+        // Scale by 1/BatchSize and incoming gradient (gy)
+        float gy_val = gy.to_cpu().data<float>()[0];
+        const float inv_batch_size = 1.0f / static_cast<float>(Z.shape().dims[0]);
+        float scale = gy_val * inv_batch_size;
+
+        // grad = (softmax - one_hot) * scale
+        //      = softmax * scale - one_hot * scale
+
+        Z_node->grad += softmax_z * scale;
+
+        // Subtract scale from target indices (works on both CPU and GPU)
+        OwnTensor::scatter_add(Z_node->grad, 1, Target, -scale);  //vis
+    }
+}
+
 //Regression Losses --------------
 void vjp_MSELoss(Node* n, const Tensor& gy){
     Node* Z_node = n->inputs[0].get();

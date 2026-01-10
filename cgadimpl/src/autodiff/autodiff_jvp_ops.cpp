@@ -376,6 +376,19 @@ Tensor jvp_MAELoss(Node* n, const std::function<const Tensor&(Node*)>& t){
     return dot_Z + dot_Y;
 }
 
+Tensor jvp_SparseCeWithLogits(Node* n, const std::function<const Tensor&(Node*)>& t){  //vis
+    Node* Z_node = n->inputs[0].get();
+    Node* Y_node = n->inputs[1].get();
+    const Tensor& Z = Z_node->value;
+    const Tensor& Y = Y_node->value;
+    Tensor max_val_z = OwnTensor::reduce_max(Z, {-1}, true);
+    Tensor exp_z = OwnTensor::exp(Z - max_val_z);
+    Tensor softmax_z = exp_z / OwnTensor::reduce_sum(exp_z, {-1}, true);
+    Tensor term1 = OwnTensor::reduce_sum(softmax_z * t(Z_node), {-1});
+    Tensor term2 = OwnTensor::gather(t(Z_node), 1, Y);
+    return OwnTensor::reduce_mean(term1 - term2);
+}
+
 Tensor jvp_BinaryCrossEntropy(Node* n, const std::function<const Tensor&(Node*)>& t){
     Node* Y_pred_node = n->inputs[0].get();
     Node* Y_true_node = n->inputs[1].get();
