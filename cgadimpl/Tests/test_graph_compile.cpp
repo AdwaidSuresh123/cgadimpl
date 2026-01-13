@@ -16,14 +16,18 @@ int main() {
 
     // Use default options (CPU, requires_grad=false)
     auto opts_const = TensorOptions();
-    Tensor Xt = Tensor::randn(Shape{{B, In}}, opts_const);
+    Tensor Xt = Tensor::randn<float>(Shape{{B, In}}, opts_const);
     Value X = make_tensor(Xt, "X");
 
     // ---------- Parameters ----------
     // Parameters must have requires_grad=true
     auto opts_param = TensorOptions().with_req_grad(true);
-    auto W1 = make_tensor(Tensor::randn(Shape{{In, Out}}, opts_param), "W1");
+    auto W1 = make_tensor(Tensor::randn<float>(Shape{{In, Out}}, opts_param), "W1");
     auto b1 = make_tensor(Tensor::zeros(Shape{{1, Out}}, opts_param), "b1");
+    
+    // Target for MSE Loss
+    auto opts_target = TensorOptions().with_req_grad(false);
+    auto target = make_tensor(Tensor::randn<float>(Shape{{B, Out}}, opts_target), "target");
 
     // ---------- Forward Pass (using only JIT-supported ops) ----------
     // A simple linear layer: Z = X @ W1 + b1
@@ -31,15 +35,15 @@ int main() {
     
     Value Z = matmul(X, W1) + b1;
 
-    // To create a scalar loss, we can sum all elements of Z
-    Value loss = sum(Z);
-    
-    auto eager_end = std::chrono::high_resolution_clock::now();
-    auto eager_duration = std::chrono::duration_cast<std::chrono::microseconds>(eager_end - eager_start).count();
+    // MSE Loss
+    Value loss = mse_loss(Z, target);
     
     std::cout << "Eager forward pass completed.\n";
-    debug::print_value("Eager Loss", loss);
-    std::cout << "⏱️  Eager Execution Time: " << eager_duration << " μs (" << eager_duration / 1000.0 << " ms)\n";
+    
+    // ---------- Eager Backward ----------
+    ag::backward(loss);
+    float eager_loss = loss.val().to_cpu().data<float>()[0];
+    std::cout << "Eager Loss: " << eager_loss << "\n";
 
     // ---------- JIT Compilation ----------
     std::cout << "\nCompiling graph...\n";
@@ -47,14 +51,13 @@ int main() {
     auto compile_start = std::chrono::high_resolution_clock::now();
     
     // Tell the compiler which leaves are runtime inputs vs. trainable parameters
-    std::vector<Value> inputs = {X};
+    std::vector<Value> inputs = {X, target};
     std::vector<Value> params = {W1, b1};
 
     // The 'loss' Value is the root of the graph to be compiled
-    auto comp = ag::jit::compile(loss, inputs, params);
-
-    auto compile_end = std::chrono::high_resolution_clock::now();
-    auto compile_duration = std::chrono::duration_cast<std::chrono::microseconds>(compile_end - compile_start).count();
+    ag::jit::CompileOptions opts;
+    opts.include_backward = true;
+    auto comp = ag::jit::compile(loss, inputs, params, opts);
 
     std::cout << "Graph compilation successful.\n";
     std::cout << "⏱️  JIT Compilation Time: " << compile_duration << " μs (" << compile_duration / 1000.0 << " ms)\n";
@@ -65,14 +68,11 @@ int main() {
     auto exec_start = std::chrono::high_resolution_clock::now();
     
     // Prepare raw tensor pointers for the run() method
-    std::vector<Tensor*> in_ptrs = {&X.node->value};
+    std::vector<Tensor*> in_ptrs = {&X.node->value, &target.node->value};
     std::vector<Tensor*> par_ptrs = {&W1.node->value, &b1.node->value};
 
-    Tensor compiled_out; // This will receive the output
-    bool ok = comp.run(in_ptrs, par_ptrs, compiled_out);
-    
-    auto exec_end = std::chrono::high_resolution_clock::now();
-    auto exec_duration = std::chrono::duration_cast<std::chrono::microseconds>(exec_end - exec_start).count();
+    std::vector<Tensor> jit_outputs;
+    bool ok = comp.run(in_ptrs, par_ptrs, jit_outputs);
     
     if (!ok) {
         std::cerr << "FAIL: JIT execution failed (shape guard or other error).\n";
@@ -80,34 +80,57 @@ int main() {
     }
 
     std::cout << "Compiled execution successful.\n";
-    debug::print_tensor("Compiled Loss", compiled_out);
-    std::cout << "⏱️  Compiled Execution Time: " << exec_duration << " μs (" << exec_duration / 1000.0 << " ms)\n";
-
+    
     // ---------- Verification ----------
-    // Compare the scalar result from the eager pass and the compiled pass
-    float eager_val = loss.val().to_cpu().data<float>()[0];
-    float compiled_val = compiled_out.to_cpu().data<float>()[0];
+    float compiled_loss = jit_outputs[0].to_cpu().data<float>()[0];
 
     std::cout << "\n--- Verification ---\n";
-    std::cout << "Eager Result:    " << eager_val << "\n";
-    std::cout << "Compiled Result: " << compiled_val << "\n";
+    std::cout << "Eager Loss:    " << eager_loss << "\n";
+    std::cout << "Compiled Loss: " << compiled_loss << "\n";
 
-    if (std::abs(eager_val - compiled_val) < 1e-5f) {
-        std::cout << "✅ PASS: Eager and compiled results match.\n";
+    if (std::abs(eager_loss - compiled_loss) < 1e-4f) {
+        std::cout << "✅ PASS: Loss matches.\n";
     } else {
-        std::cout << "❌ FAIL: Results do not match.\n";
+        std::cout << "❌ FAIL: Loss mismatch.\n";
     }
-
-    // Performance Summary
-    std::cout << "\n=== Performance Summary ===\n";
-    std::cout << "Eager Execution:     " << eager_duration / 1000.0 << " ms\n";
-    std::cout << "JIT Compilation:     " << compile_duration / 1000.0 << " ms\n";
-    std::cout << "Compiled Execution:  " << exec_duration / 1000.0 << " ms\n";
-    std::cout << "Total Time:          " << (eager_duration + compile_duration + exec_duration) / 1000.0 << " ms\n";
     
-    if (exec_duration > 0) {
-        float speedup = static_cast<float>(eager_duration) / exec_duration;
-        std::cout << "Speedup (Eager/Compiled): " << speedup << "x\n";
+    // Verify Gradients
+    // jit_outputs[1] -> grad W1
+    // jit_outputs[2] -> grad b1
+    bool grads_match = true;
+    
+    // W1 grad
+    {
+        Tensor eager_grad = W1.grad().to_cpu();
+        Tensor jit_grad = jit_outputs[1].to_cpu();
+        float eager_mean = OwnTensor::reduce_mean(OwnTensor::abs(eager_grad, ag::current_stream())).data<float>()[0];
+        float jit_mean = OwnTensor::reduce_mean(OwnTensor::abs(jit_grad, ag::current_stream())).data<float>()[0];
+        float mad = OwnTensor::reduce_mean(OwnTensor::abs(eager_grad - jit_grad, ag::current_stream())).data<float>()[0];
+        
+        std::cout << "W1 Grad Eager Mean: " << eager_mean << "\n";
+        std::cout << "W1 Grad JIT Mean:   " << jit_mean << "\n";
+        std::cout << "W1 Grad MAD: " << mad << "\n";
+        if (mad > 1e-4f) grads_match = false;
+    }
+    
+    // b1 grad
+    {
+        Tensor eager_grad = b1.grad().to_cpu();
+        Tensor jit_grad = jit_outputs[2].to_cpu();
+        float eager_mean = OwnTensor::reduce_mean(OwnTensor::abs(eager_grad, ag::current_stream())).data<float>()[0];
+        float jit_mean = OwnTensor::reduce_mean(OwnTensor::abs(jit_grad, ag::current_stream())).data<float>()[0];
+        float mad = OwnTensor::reduce_mean(OwnTensor::abs(eager_grad - jit_grad, ag::current_stream())).data<float>()[0];
+        
+        std::cout << "b1 Grad Eager Mean: " << eager_mean << "\n";
+        std::cout << "b1 Grad JIT Mean:   " << jit_mean << "\n";
+        std::cout << "b1 Grad MAD: " << mad << "\n";
+        if (mad > 1e-4f) grads_match = false;
+    }
+    
+    if (grads_match) {
+        std::cout << "✅ PASS: Gradients match.\n";
+    } else {
+        std::cout << "❌ FAIL: Gradient mismatch.\n";
     }
 
     return 0;

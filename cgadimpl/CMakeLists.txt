@@ -212,6 +212,8 @@ if(true)
   add_ag_test(test_memory_                                    Tests/benchmark_memory_approaches.cpp )
   
   add_ag_test(test_autograd_hooks                             Tests/autograd_hooks_testing/test_hooks.cpp)
+  add_ag_test(test_register_ops                               Tests/test_register_ops.cpp)
+  add_ag_test(test_performance_metrics                        Tests/test_performance_metrics.cpp)
  
   # Ops Tests
 #   add_ag_test(test_activation                  Tests/ops_test/test_activation.cpp)

@@ -1,5 +1,7 @@
 #!/bin/bash
 #!/bin/bash
+#!/bin/bash
+#!/bin/bash
 set -euo pipefail
 
 # --- Configuration ---
@@ -25,7 +27,23 @@ export CUDACXX=/usr/local/cuda/bin/nvcc
 # Add CUDA and Nova-Compiler binaries to PATH so they are found at runtime
 export PATH="/usr/local/cuda/bin:$ROOT/Nova-Compiler/install/bin:$PATH"
 
+# --- Toolchain Setup ---
+# CUDA 12.6 is the installed version.
+export CUDACXX=/usr/local/cuda/bin/nvcc
+# Add CUDA and Nova-Compiler binaries to PATH so they are found at runtime
+export PATH="/usr/local/cuda/bin:$ROOT/Nova-Compiler/install/bin:$PATH"
+
+# --- Toolchain Setup ---
+# CUDA 12.6 is the installed version.
+export CUDACXX=/usr/local/cuda/bin/nvcc
+# Add CUDA and Nova-Compiler binaries to PATH so they are found at runtime
+export PATH="/usr/local/cuda/bin:$ROOT/Nova-Compiler/install/bin:$PATH"
+
 echo "== Build Type:    $BUILD_TYPE"
+echo "== Using CUDA CXX: $CUDACXX"
+echo "== PATH: $PATH"
+echo "== Using CUDA CXX: $CUDACXX"
+echo "== PATH: $PATH"
 echo "== Using CUDA CXX: $CUDACXX"
 echo "== PATH: $PATH"
 echo "== Using CUDA CXX: $CUDACXX"

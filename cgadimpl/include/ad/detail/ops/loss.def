@@ -38,3 +38,11 @@ OP(MSELoss,       2, "mseloss")          // Mean Squared Error
 OP(MAELoss,       2, "maeloss")          // Mean Absolute Error (L1 Loss)
                                           // Formula: mean(|pred - target|)
                                           // More robust to outliers than MSE
+
+OP(BinaryCrossEntropy,    2,  "binary_cross_entropy")
+
+OP(CategoricalCrossEntropy,   2,   "categorical_cross_entropy")
+
+OP(SparseCeWithLogits,  2, "sparse_ce_with_logits")   // Cross-entropy from raw logits
+                                          // Arity=2: (logits, one_hot_targets)
+                                          // Internally: -sum(target * log_softmax(logits))

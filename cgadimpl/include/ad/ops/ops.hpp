@@ -5,6 +5,8 @@
 #include "ad/core/graph.hpp"
 #include "ad/ops/nodeops.hpp"
 #include "ad/autodiff/checkpoint.hpp"
+#include "mlp/layers.h"
+#include "mlp/loss.h"
 
 
 namespace ag {
@@ -65,14 +67,19 @@ Value transpose(const Value& x);
 //Fused Operations (better performance, fewer memory accesses) ---------------
 Value linear(const Value& a, const Value& b, const Value& c);
 Value fmab(const Value& a, const Value& b, const Value& c); // fused multiply-add a@b + c
+Value dropout(const Value& a, const Value& b);
+Value flatten(const Value& a);
 
 //Classification losses ---------------
 Value cross_entropy_with_logits(const Value& logits, const Value& onehot);
 Value kldivergence(const Value& logits, const Value& onehot);
+Value sparse_cross_entropy_with_logits(const Value& logits, const Value& target);
 
 //Regression Losses --------------
 Value mse_loss(const Value& pred, const Value& target);
 Value mae_loss(const Value& pred, const Value& target);
+Value binary_cross_entropy(const Value& pred, const Value& target);
+Value categorical_cross_entropy(const Value& pred, const Value& target);
 
 //Layer Normalization ------------
 Value laynor(const Value& x); 

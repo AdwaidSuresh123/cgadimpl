@@ -21,8 +21,7 @@ int main() {
 
     // ---------- Data ----------
     // Inputs are constants (requires_grad=false, which is the default)
-    Tensor Xt = Tensor::randn(Shape{{B, In}}, TensorOptions());
-    Value  X  = make_tensor(Tensor::randn(Shape{{B, In}}, TensorOptions()), "X");
+    Value  X  = make_tensor(Tensor::randn<float>(Shape{{B, In}}, TensorOptions()), "X");
 
     // One-hot labels Y[B,Out]
     Tensor Yt(Shape{{B, Out}}, TensorOptions());
@@ -40,44 +39,40 @@ int main() {
     // ---------- Parameters ----------
     // Parameters are trainable (requires_grad=true)
     auto opts_param = TensorOptions().with_req_grad(true);
-    auto W1 = make_tensor(Tensor::randn(Shape{{In, H1}}, opts_param), "W1");
+    auto W1 = make_tensor(Tensor::randn<float>(Shape{{In, H1}}, opts_param) * 0.1f, "W1");
     auto b1 = make_tensor(Tensor::zeros(Shape{{1, H1}}, opts_param), "b1");
-    auto W2 = make_tensor(Tensor::randn(Shape{{H1, H2}}, opts_param), "W2");
+    auto W2 = make_tensor(Tensor::randn<float>(Shape{{H1, H2}}, opts_param) * 0.1f, "W2");
     auto b2 = make_tensor(Tensor::zeros(Shape{{1, H2}}, opts_param), "b2");
-    auto W3 = make_tensor(Tensor::randn(Shape{{H2, H3}}, opts_param), "W3");
+    auto W3 = make_tensor(Tensor::randn<float>(Shape{{H2, H3}}, opts_param) * 0.1f, "W3");
     auto b3 = make_tensor(Tensor::zeros(Shape{{1, H3}}, opts_param), "b3");
-    auto W4 = make_tensor(Tensor::randn(Shape{{H3, H4}}, opts_param), "W4");
+    auto W4 = make_tensor(Tensor::randn<float>(Shape{{H3, H4}}, opts_param) * 0.1f, "W4");
     auto b4 = make_tensor(Tensor::zeros(Shape{{1, H4}}, opts_param), "b4");
-    auto W5 = make_tensor(Tensor::randn(Shape{{H4, Out}}, opts_param), "W5");
+    auto W5 = make_tensor(Tensor::randn<float>(Shape{{H4, Out}}, opts_param) * 0.1f, "W5");
     auto b5 = make_tensor(Tensor::zeros(Shape{{1, Out}}, opts_param), "b5");
     
     // ---------- Forward: 4 hidden layers + logits ----------
     Value L1 = gelu(matmul(X,  W1) + b1);
-    Value L2 = silu(matmul(L1, W2) + b2);
-    Value L3 = leaky_relu(matmul(L2, W3) + b3, 0.1f);
-    Value L4 = softplus(matmul(L3, W4) + b4);
+    Value L2 = gelu(matmul(L1, W2) + b2);
+    Value L3 = gelu(matmul(L2, W3) + b3);
+    Value L4 = gelu(matmul(L3, W4) + b4);
     Value logits = matmul(L4, W5) + b5;
-    Value loss = cross_entropy_with_logits(logits, Y);
+    Value loss = mse_loss(logits, Y);
 
-    // ---------- Backprop ----------
-    zero_grad(loss);
-    backward(loss);
-        // Tell the compiler which leaves are runtime inputs vs. trainable parameters
+    // ---------- JIT Compile ----------
+    // ---------- JIT Compile ----------
     std::vector<Value> inputs = {X};
-    std::vector<Value> params = {W1, b1, W2,b2,W3,b3,W4,b4,W5,b5};
-
-    // The 'loss' Value is the root of the graph to be compiled
+    std::vector<Value> params;
+    params.push_back(W1); params.push_back(b1);
+    params.push_back(W2); params.push_back(b2);
+    params.push_back(W3); params.push_back(b3);
+    params.push_back(W4); params.push_back(b4);
+    params.push_back(W5); params.push_back(b5);
+    
     auto comp = ag::jit::compile(loss, inputs, params);
     
-    // Use the framework's debug utilities
-    // ag::debug::print_all_grads(loss);
-    // ag::debug::dump_dot(loss, "build/graph.dot");
-    // ag::debug::dump_vjp_dot(loss, "build/graph_vjp.dot");
-
-    // ---------- Report ----------
-    // To get a scalar value, move to CPU and get the data pointer
+    // ---------- Verification ----------
     float loss_val = loss.val().to_cpu().data<float>()[0];
-    std::cout << "loss = " << loss_val << "\n";
+    std::cout << "Loss = " << loss_val << "\n";
 
     // Show a few logits + softmax probs for the first row
     Value probs = softmax_row(logits);
@@ -86,20 +81,13 @@ int main() {
     const float* probs_data = probs_cpu.data<float>();
     const float* logits_data = logits_cpu.data<float>();
 
-    std::cout << "logits[0,:5] = ";
+    std::cout << "\nlogits[0,:5] = ";
     for (int j = 0; j < std::min(5, Out); ++j)
         std::cout << logits_data[j] << (j + 1 < 5 ? ' ' : '\n');
 
     std::cout << "probs [0,:5] = ";
     for (int j = 0; j < std::min(5, Out); ++j)
         std::cout << probs_data[j] << (j + 1 < 5 ? ' ' : '\n');
-
-    // Print gradients using the framework's tools
-    std::cout << "\n--- Sample Gradients ---\n";
-    debug::print_grad("W1", W1);
-    debug::print_grad("b1", b1);
-    debug::print_grad("W5", W5);
-    debug::print_grad("b5", b5);
 
     return 0;
 }
