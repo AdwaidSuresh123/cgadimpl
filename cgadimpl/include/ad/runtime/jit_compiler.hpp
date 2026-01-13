@@ -21,11 +21,16 @@ struct Compiled {
     std::string mlir_source;
     std::shared_ptr<void> mlir_module;
     std::string mlir_module_str;
+    void* compiled_func = nullptr;
     
     // Execute the compiled plan
     bool run(const std::vector<Tensor*>& inputs,
              const std::vector<Tensor*>& params,
              Tensor& out) const;
+
+    bool run(const std::vector<Tensor*>& inputs,
+             const std::vector<Tensor*>& params,
+             std::vector<Tensor>& outs) const;
 
     const std::string& getMLIRSource() const;
     void* getMLIRModule() const;
@@ -33,6 +38,7 @@ struct Compiled {
 
 struct CompileOptions {
     bool use_cuda_graph = false;
+    bool include_backward = false;
     // ... optimization flags ...
 };
 

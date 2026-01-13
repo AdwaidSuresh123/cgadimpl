@@ -82,7 +82,7 @@ struct Plan {
     Signature sig;
     std::vector<Step> steps;
     int num_slots{0};
-    int out_slot{-1};
+    std::vector<int> out_slots;
 };
 
 /// MLIR Emitter - Creates MLIR module using OpBuilder from computational graph
