@@ -58,9 +58,14 @@ int main() {
     Value logits = matmul(L4, W5) + b5;
     Value loss = mse_loss(logits, Y);
 
+
+    // ---------- Eager Forward + Backward ----------
+    ag::backward(loss);
+    float eager_loss = loss.val().to_cpu().data<float>()[0];
+    std::cout << "Eager Loss = " << eager_loss << "\n";
+
     // ---------- JIT Compile ----------
-    // ---------- JIT Compile ----------
-    std::vector<Value> inputs = {X};
+    std::vector<Value> inputs = {X, Y};  // Include Y as input
     std::vector<Value> params;
     params.push_back(W1); params.push_back(b1);
     params.push_back(W2); params.push_back(b2);
@@ -68,26 +73,66 @@ int main() {
     params.push_back(W4); params.push_back(b4);
     params.push_back(W5); params.push_back(b5);
     
-    auto comp = ag::jit::compile(loss, inputs, params);
+    std::cout << "\nCompiling graph...\n";
+    ag::jit::CompileOptions opts;
+    opts.include_backward = true;
+    auto compiled = ag::jit::compile(loss, inputs, params, opts);
+    std::cout << "Graph compilation successful.\n";
+
+    // ---------- Run Compiled Function ----------
+    std::cout << "\nRunning compiled graph...\n";
     
+    // Prepare input tensors
+    Tensor X_tensor = X.val();
+    Tensor Y_tensor = Y.val();
+    std::vector<Tensor*> input_ptrs = {&X_tensor, &Y_tensor};
+    
+    // Prepare param tensors
+    Tensor W1_t = W1.val(), b1_t = b1.val();
+    Tensor W2_t = W2.val(), b2_t = b2.val();
+    Tensor W3_t = W3.val(), b3_t = b3.val();
+    Tensor W4_t = W4.val(), b4_t = b4.val();
+    Tensor W5_t = W5.val(), b5_t = b5.val();
+    std::vector<Tensor*> param_ptrs = {&W1_t, &b1_t, &W2_t, &b2_t, &W3_t, &b3_t, &W4_t, &b4_t, &W5_t, &b5_t};
+    
+    std::vector<Tensor> jit_outputs;
+    if (!compiled.run(input_ptrs, param_ptrs, jit_outputs)) {
+        std::cerr << "FAIL: JIT execution failed.\n";
+        return 1;
+    }
+    
+    std::cout << "Compiled execution successful.\n";
+    std::cout << "JIT returned " << jit_outputs.size() << " outputs.\n";
+
     // ---------- Verification ----------
-    float loss_val = loss.val().to_cpu().data<float>()[0];
-    std::cout << "Loss = " << loss_val << "\n";
-
-    // Show a few logits + softmax probs for the first row
-    Value probs = softmax_row(logits);
-    Tensor probs_cpu = probs.val().to_cpu();
-    Tensor logits_cpu = logits.val().to_cpu();
-    const float* probs_data = probs_cpu.data<float>();
-    const float* logits_data = logits_cpu.data<float>();
-
-    std::cout << "\nlogits[0,:5] = ";
-    for (int j = 0; j < std::min(5, Out); ++j)
-        std::cout << logits_data[j] << (j + 1 < 5 ? ' ' : '\n');
-
-    std::cout << "probs [0,:5] = ";
-    for (int j = 0; j < std::min(5, Out); ++j)
-        std::cout << probs_data[j] << (j + 1 < 5 ? ' ' : '\n');
-
-    return 0;
+    float jit_loss = jit_outputs[0].to_cpu().data<float>()[0];
+    
+    std::cout << "\n--- Verification ---\n";
+    std::cout << "Eager Loss:    " << eager_loss << "\n";
+    std::cout << "Compiled Loss: " << jit_loss << "\n";
+    
+    bool pass = true;
+    if (std::abs(eager_loss - jit_loss) < 1e-3f) {
+        std::cout << "✅ PASS: Loss matches.\n";
+    } else {
+        std::cout << "❌ FAIL: Loss mismatch.\n";
+        pass = false;
+    }
+    
+    // Verify first param gradient (W1)
+    if (jit_outputs.size() > 1) {
+        Tensor eager_grad = W1.grad().to_cpu();
+        Tensor jit_grad = jit_outputs[1].to_cpu();
+        float mad = OwnTensor::reduce_mean(OwnTensor::abs(eager_grad - jit_grad, ag::current_stream())).data<float>()[0];
+        std::cout << "W1 Grad MAD: " << mad << "\n";
+        if (mad > 1e-3f) pass = false;
+    }
+    
+    if (pass) {
+        std::cout << "✅ PASS: All verifications passed.\n";
+        return 0;
+    } else {
+        std::cout << "❌ FAIL: Some verifications failed.\n";
+        return 1;
+    }
 }

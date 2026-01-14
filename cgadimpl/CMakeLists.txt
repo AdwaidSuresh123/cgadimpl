@@ -211,6 +211,7 @@ if(true)
   add_ag_test(test_autograd_hooks                             Tests/autograd_hooks_testing/test_hooks.cpp)
   add_ag_test(test_register_ops                               Tests/test_register_ops.cpp)
   add_ag_test(test_performance_metrics                        Tests/test_performance_metrics.cpp)
+  add_ag_test(test_jit_edge_cases                             Tests/test_jit_edge_cases.cpp)
  
   # Ops Tests
 #   add_ag_test(test_activation                  Tests/ops_test/test_activation.cpp)

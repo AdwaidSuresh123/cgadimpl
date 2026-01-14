@@ -1,7 +1,3 @@
-// =====================
-// file: cgadimpl/src/core/mlir_emitter.cpp
-// MLIR C++ API implementation for direct graph emission
-// =====================
 #include "ad/core/mlir_emitter.hpp"
 #include "ad/core/graph.hpp"
 #include "ad/core/schema.hpp"
@@ -267,6 +263,14 @@ MLIREmitter::emitModule(const Plan& plan) {
             case Op::Tanh:
                 if (operands.size() == 1) {
                     result = builder.create<mlir::nova::TanhOp>(
+                        loc, resultType, operands[0]
+                    ).getResult();
+                }
+                break;
+
+            case Op::Sign:
+                if (operands.size() == 1) {
+                    result = builder.create<mlir::nova::SignOp>(
                         loc, resultType, operands[0]
                     ).getResult();
                 }

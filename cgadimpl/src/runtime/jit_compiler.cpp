@@ -14,8 +14,33 @@
 #include "mlp/activation.h"
 #include <fstream>
 #include <dlfcn.h>
+#include <random>
 
 namespace ag::jit {
+
+struct AOTContext {
+    void* ciface_func = nullptr;
+    void* dl_handle = nullptr;
+    Plan plan;
+    std::string mlir_source;
+
+    ~AOTContext() {
+        if (dl_handle) {
+            dlclose(dl_handle);
+        }
+    }
+};
+
+static size_t getElementSize(OwnTensor::Dtype dtype) {
+    switch (dtype) {
+        case OwnTensor::Dtype::Float32: return 4;
+        case OwnTensor::Dtype::Float16: return 2;
+        case OwnTensor::Dtype::Bfloat16: return 2;
+        case OwnTensor::Dtype::Int32: return 4;
+        case OwnTensor::Dtype::Int64: return 8;
+        default: return 4;
+    }
+}
 
 using ag::Op;
 using ag::Node;
@@ -56,6 +81,7 @@ struct Compiled::Impl {
             case Op::Log:        return OwnTensor::log(*a[0]);
             case Op::Tanh:       return OwnTensor::trig::tanh(*a[0]);
             case Op::GELU:       return OwnTensor::mlp_forward::GeLU(*a[0]);
+            case Op::Sign:       { cudaStream_t stream = (cudaStream_t)ag::current_stream(); return OwnTensor::sign(*a[0], stream); }
             
             case Op::MatMul:     return OwnTensor::matmul(*a[0], *a[1]);
 
@@ -345,8 +371,8 @@ static std::string emitMLIR(const Plan& plan) {
 }
 
 // Forward declarations for AOT compilation helpers
-void* compileAndLoad(const std::string& mlir_source);
-void storeAOTContext(void* func_ptr, const Plan& plan, const std::string& mlir_source);
+void* compileAndLoad(const std::string& mlir_source, void** out_dl_handle);
+void storeAOTContext(void* func_ptr, void* dl_handle, const Plan& plan, const std::string& mlir_source, std::shared_ptr<void>& out_context);
 
 Compiled compile(const Value& output,
                  const std::vector<Value>& inputs,
@@ -374,7 +400,7 @@ Compiled compile(const Value& output,
         if (n->op == Op::Leaf) continue;
         Step st;
         st.op = n->op;
-        st.out_meta = {n->shape(), n->value.dtype(), n->value.device()};
+        st.out_meta = ag::jit::TensorMetadata(n->shape(), n->value.dtype(), n->value.device());
         st.out_slot = plan.num_slots++;
         slot_of[n] = st.out_slot;
 
@@ -409,7 +435,7 @@ Compiled compile(const Value& output,
             auto opts = OwnTensor::TensorOptions().with_dtype(dt).with_device(dev);
             Tensor one = OwnTensor::Tensor::ones(Shape{{1}}, opts);
             st.args.push_back(ArgLit{one});
-            st.out_meta = {output.shape(), output.val().dtype(), output.val().device()};
+            st.out_meta = ag::jit::TensorMetadata(output.shape(), output.val().dtype(), output.val().device());
             st.out_slot = plan.num_slots++;
             grad_slot_of[output.node.get()] = st.out_slot;
             plan.steps.push_back(std::move(st));
@@ -421,14 +447,50 @@ Compiled compile(const Value& output,
             if (grad_slot_of.find(n) == grad_slot_of.end()) continue; // No gradient for this node
             
             int grad_slot = grad_slot_of[n];
+
+            auto accumulate_grad = [&](Node* node, int slot) {
+                if (grad_slot_of.count(node)) {
+                    Step acc;
+                    acc.op = Op::Add;
+                    acc.args.push_back(ArgSlot{grad_slot_of[node]});
+                    acc.args.push_back(ArgSlot{slot});
+                    acc.out_meta = ag::jit::TensorMetadata(node->shape(), node->value.dtype(), node->value.device());
+                    acc.out_slot = plan.num_slots++;
+                    grad_slot_of[node] = acc.out_slot;
+                    plan.steps.push_back(std::move(acc));
+                } else {
+                    grad_slot_of[node] = slot;
+                }
+            };
             
             // Generate backward steps based on op
-            if (n->op == Op::Add) {
-                // z = x + y => dx = dz, dy = dz
-                for (auto& input : n->inputs) {
+            if (n->op == Op::Add || n->op == Op::Sub) {
+                // z = x + y => dx = dz, dy = dz (or -dz for Sub)
+                for (size_t i = 0; i < n->inputs.size(); ++i) {
+                    Node* input = n->inputs[i].get();
                     if (input->requires_grad()) {
                         int current_grad_slot = grad_slot;
                         
+                        // Handle Sub second operand
+                        if (n->op == Op::Sub && i == 1) {
+                            Step neg;
+                            neg.op = Op::Leaf;
+                            Tensor neg_one = OwnTensor::Tensor::full(Shape{{1}}, ag::options(input->value), -1.0f);
+                            neg.args.push_back(ArgLit{neg_one});
+                            neg.out_meta = ag::jit::TensorMetadata(std::vector<int64_t>{}, input->value.dtype(), input->value.device());
+                            neg.out_slot = plan.num_slots++;
+                            plan.steps.push_back(neg);
+                            
+                            Step st;
+                            st.op = Op::Mul;
+                            st.args.push_back(ArgSlot{grad_slot});
+                            st.args.push_back(ArgSlot{neg.out_slot});
+                            st.out_meta = ag::jit::TensorMetadata(n->shape(), input->value.dtype(), input->value.device());
+                            st.out_slot = plan.num_slots++;
+                            plan.steps.push_back(st);
+                            current_grad_slot = st.out_slot;
+                        }
+
                         // Handle broadcasting: if input shape is {1, C} and output is {B, C}, sum over dim 0
                         if (input->shape().size() == 2 && n->shape().size() == 2 && 
                             input->shape()[0] == 1 && n->shape()[0] > 1) {
@@ -436,8 +498,8 @@ Compiled compile(const Value& output,
                             // 1. Transpose dz: {B, C} -> {C, B}
                             Step t1;
                             t1.op = Op::Transpose;
-                            t1.args.push_back(ArgSlot{grad_slot});
-                            t1.out_meta = { {n->shape()[1], n->shape()[0]}, n->value.dtype(), n->value.device() };
+                            t1.args.push_back(ArgSlot{current_grad_slot});
+                            t1.out_meta = ag::jit::TensorMetadata( {n->shape()[1], n->shape()[0]}, n->value.dtype(), n->value.device());
                             t1.out_slot = plan.num_slots++;
                             plan.steps.push_back(t1);
                             
@@ -445,7 +507,7 @@ Compiled compile(const Value& output,
                             Step r1;
                             r1.op = Op::RowSum;
                             r1.args.push_back(ArgSlot{t1.out_slot});
-                            r1.out_meta = { {n->shape()[1], 1}, n->value.dtype(), n->value.device() };
+                            r1.out_meta = ag::jit::TensorMetadata(std::vector<int64_t>{n->shape()[1], 1}, n->value.dtype(), n->value.device());
                             r1.out_slot = plan.num_slots++;
                             plan.steps.push_back(r1);
                             
@@ -453,27 +515,71 @@ Compiled compile(const Value& output,
                             Step t2;
                             t2.op = Op::Transpose;
                             t2.args.push_back(ArgSlot{r1.out_slot});
-                            t2.out_meta = { {1, n->shape()[1]}, n->value.dtype(), n->value.device() };
+                            t2.out_meta = ag::jit::TensorMetadata(std::vector<int64_t>{1, n->shape()[1]}, n->value.dtype(), n->value.device());
                             t2.out_slot = plan.num_slots++;
                             plan.steps.push_back(t2);
                             
                             current_grad_slot = t2.out_slot;
                         }
-
-                        int input_grad_slot;
-                        if (grad_slot_of.count(input.get())) {
-                            // Accumulate
-                            Step st;
-                            st.op = Op::Add;
-                            st.args.push_back(ArgSlot{grad_slot_of[input.get()]});
-                            st.args.push_back(ArgSlot{current_grad_slot});
-                            st.out_meta = {input->shape(), input->value.dtype(), input->value.device()};
-                            st.out_slot = plan.num_slots++;
-                            grad_slot_of[input.get()] = st.out_slot; // Update to new accumulated slot
-                            plan.steps.push_back(std::move(st));
-                        } else {
-                            grad_slot_of[input.get()] = current_grad_slot; 
+                        // Handle broadcasting: if input shape is {B, 1} and output is {B, C}, sum over dim 1
+                        else if (input->shape().size() == 2 && n->shape().size() == 2 && 
+                                 input->shape()[1] == 1 && n->shape()[1] > 1) {
+                            // RowSum: {B, C} -> {B, 1}
+                            Step r1;
+                            r1.op = Op::RowSum;
+                            r1.args.push_back(ArgSlot{current_grad_slot});
+                            r1.out_meta = ag::jit::TensorMetadata(std::vector<int64_t>{n->shape()[0], 1}, n->value.dtype(), n->value.device());
+                            r1.out_slot = plan.num_slots++;
+                            plan.steps.push_back(r1);
+                            current_grad_slot = r1.out_slot;
                         }
+
+                        accumulate_grad(input, current_grad_slot);
+                    }
+                }
+            } else if (n->op == Op::Mul) {
+                // z = x * y => dx = dz * y, dy = dz * x
+                for (size_t i = 0; i < 2; ++i) {
+                    Node* input = n->inputs[i].get();
+                    Node* other = n->inputs[1 - i].get();
+                    if (input->requires_grad()) {
+                        Step st;
+                        st.op = Op::Mul;
+                        st.args.push_back(ArgSlot{grad_slot});
+                        
+                        if (slot_of.count(other)) st.args.push_back(ArgSlot{slot_of[other]});
+                        else if (is_in(in_ix, other)) st.args.push_back(ArgInput{in_ix[other]});
+                        else if (is_in(par_ix, other)) st.args.push_back(ArgParam{par_ix[other]});
+                        else st.args.push_back(ArgLit{other->value});
+                        
+                        st.out_meta = ag::jit::TensorMetadata(n->shape(), n->value.dtype(), n->value.device());
+                        st.out_slot = plan.num_slots++;
+                        plan.steps.push_back(st);
+                        
+                        int current_grad_slot = st.out_slot;
+                        
+                        // Handle broadcasting (same as Add)
+                        if (input->shape().size() == 2 && n->shape().size() == 2 && 
+                            input->shape()[0] == 1 && n->shape()[0] > 1) {
+                            Step t1; t1.op = Op::Transpose; t1.args.push_back(ArgSlot{current_grad_slot});
+                            t1.out_meta = ag::jit::TensorMetadata( {n->shape()[1], n->shape()[0]}, n->value.dtype(), n->value.device());
+                            t1.out_slot = plan.num_slots++; plan.steps.push_back(t1);
+                            Step r1; r1.op = Op::RowSum; r1.args.push_back(ArgSlot{t1.out_slot});
+                            r1.out_meta = ag::jit::TensorMetadata( {n->shape()[1], 1}, n->value.dtype(), n->value.device());
+                            r1.out_slot = plan.num_slots++; plan.steps.push_back(r1);
+                            Step t2; t2.op = Op::Transpose; t2.args.push_back(ArgSlot{r1.out_slot});
+                            t2.out_meta = ag::jit::TensorMetadata( {1, n->shape()[1]}, n->value.dtype(), n->value.device());
+                            t2.out_slot = plan.num_slots++; plan.steps.push_back(t2);
+                            current_grad_slot = t2.out_slot;
+                        } else if (input->shape().size() == 2 && n->shape().size() == 2 && 
+                                   input->shape()[1] == 1 && n->shape()[1] > 1) {
+                            Step r1; r1.op = Op::RowSum; r1.args.push_back(ArgSlot{current_grad_slot});
+                            r1.out_meta = ag::jit::TensorMetadata( {n->shape()[0], 1}, n->value.dtype(), n->value.device());
+                            r1.out_slot = plan.num_slots++; plan.steps.push_back(r1);
+                            current_grad_slot = r1.out_slot;
+                        }
+                        
+                        accumulate_grad(input, current_grad_slot);
                     }
                 }
             } else if (n->op == Op::MatMul) {
@@ -494,12 +600,12 @@ Compiled compile(const Value& output,
                     else if (is_in(par_ix, y)) t_op.args.push_back(ArgParam{par_ix[y]});
                     else t_op.args.push_back(ArgLit{y->value});
                     
-                    t_op.out_meta = { {y->shape()[1], y->shape()[0]}, y->value.dtype(), y->value.device()};
+                    t_op.out_meta = ag::jit::TensorMetadata( {y->shape()[1], y->shape()[0]}, y->value.dtype(), y->value.device());
                     t_op.out_slot = plan.num_slots++;
                     plan.steps.push_back(t_op);
                     
                     st.args.push_back(ArgSlot{t_op.out_slot});
-                    st.out_meta = {x->shape(), x->value.dtype(), x->value.device()};
+                    st.out_meta = ag::jit::TensorMetadata(x->shape(), x->value.dtype(), x->value.device());
                     st.out_slot = plan.num_slots++;
                     
                     if (grad_slot_of.count(x)) {
@@ -530,58 +636,197 @@ Compiled compile(const Value& output,
                     else if (is_in(par_ix, x)) t_op.args.push_back(ArgParam{par_ix[x]});
                     else t_op.args.push_back(ArgLit{x->value});
                     
-                    t_op.out_meta = { {x->shape()[1], x->shape()[0]}, x->value.dtype(), x->value.device()};
+                    t_op.out_meta = ag::jit::TensorMetadata( {x->shape()[1], x->shape()[0]}, x->value.dtype(), x->value.device());
                     t_op.out_slot = plan.num_slots++;
                     plan.steps.push_back(t_op);
                     
                     st.args.push_back(ArgSlot{t_op.out_slot});
                     st.args.push_back(ArgSlot{grad_slot});
-                    st.out_meta = {y->shape(), y->value.dtype(), y->value.device()};
+                    st.out_meta = ag::jit::TensorMetadata(y->shape(), y->value.dtype(), y->value.device());
                     st.out_slot = plan.num_slots++;
-                    
-                    if (grad_slot_of.count(y)) {
-                        Step acc;
-                        acc.op = Op::Add;
-                        acc.args.push_back(ArgSlot{grad_slot_of[y]});
-                        acc.args.push_back(ArgSlot{st.out_slot});
-                        acc.out_meta = st.out_meta;
-                        acc.out_slot = plan.num_slots++;
-                        plan.steps.push_back(std::move(st));
-                        plan.steps.push_back(std::move(acc));
-                        grad_slot_of[y] = acc.out_slot;
-                    } else {
-                        plan.steps.push_back(std::move(st));
-                        grad_slot_of[y] = st.out_slot;
-                    }
+                    plan.steps.push_back(std::move(st));
+                    accumulate_grad(y, st.out_slot);
                 }
-            } else if (n->op == Op::GELU) {
-                // Identity backward approximation for now
+            } else if (n->op == Op::Relu) {
                 Node* input = n->inputs[0].get();
                 if (input->requires_grad()) {
-                     if (grad_slot_of.count(input)) {
+                    // dx = dz * (x > 0 ? 1 : 0)
+                    // We implement this as dz * Sign(Relu(x))
+                    
+                    // 1. Relu(x)
+                    Step relu_step;
+                    relu_step.op = Op::Relu;
+                    if (slot_of.count(input)) relu_step.args.push_back(ArgSlot{slot_of[input]});
+                    else if (is_in(in_ix, input)) relu_step.args.push_back(ArgInput{in_ix[input]});
+                    else if (is_in(par_ix, input)) relu_step.args.push_back(ArgParam{par_ix[input]});
+                    else relu_step.args.push_back(ArgLit{input->value});
+                    relu_step.out_meta = ag::jit::TensorMetadata( input->shape(), input->value.dtype(), input->value.device());
+                    relu_step.out_slot = plan.num_slots++;
+                    plan.steps.push_back(relu_step);
+                    
+                    // 2. Sign(Relu(x))
+                    Step sign_step;
+                    sign_step.op = Op::Sign;
+                    sign_step.args.push_back(ArgSlot{relu_step.out_slot});
+                    sign_step.out_meta = relu_step.out_meta;
+                    sign_step.out_slot = plan.num_slots++;
+                    plan.steps.push_back(sign_step);
+                    
+                    // 3. dz * Sign(Relu(x))
+                    Step mul_step;
+                    mul_step.op = Op::Mul;
+                    mul_step.args.push_back(ArgSlot{grad_slot});
+                    mul_step.args.push_back(ArgSlot{sign_step.out_slot});
+                    mul_step.out_meta = sign_step.out_meta;
+                    mul_step.out_slot = plan.num_slots++;
+                    plan.steps.push_back(mul_step);
+                    
+                    if (grad_slot_of.count(input)) {
                         Step acc;
                         acc.op = Op::Add;
                         acc.args.push_back(ArgSlot{grad_slot_of[input]});
-                        acc.args.push_back(ArgSlot{grad_slot});
-                        acc.out_meta = {input->shape(), input->value.dtype(), input->value.device()};
+                        acc.args.push_back(ArgSlot{mul_step.out_slot});
+                        acc.out_meta = mul_step.out_meta;
                         acc.out_slot = plan.num_slots++;
                         grad_slot_of[input] = acc.out_slot;
                         plan.steps.push_back(std::move(acc));
                     } else {
-                        grad_slot_of[input] = grad_slot;
+                        grad_slot_of[input] = mul_step.out_slot;
+                    }
+                }
+            } else if (n->op == Op::GELU) {
+                Node* input = n->inputs[0].get();
+                if (input->requires_grad()) {
+                    // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+                    // For now, let's use a simpler approximation: GELU'(x) = sigmoid(1.702 * x)
+                    // This is a common approximation for GELU derivative.
+                    
+                    // 1. Constant 1.702
+                    Step c1;
+                    c1.op = Op::Leaf;
+                    Tensor c1_t = OwnTensor::Tensor::full(Shape{{1}}, OwnTensor::TensorOptions().with_dtype(input->value.dtype()).with_device(input->value.device()), 1.702f);
+                    c1.args.push_back(ArgLit{c1_t});
+                    c1.out_meta = ag::jit::TensorMetadata( {}, input->value.dtype(), input->value.device());
+                    c1.out_slot = plan.num_slots++;
+                    plan.steps.push_back(c1);
+                    
+                    // 2. 1.702 * x
+                    Step m1;
+                    m1.op = Op::Mul;
+                    if (slot_of.count(input)) m1.args.push_back(ArgSlot{slot_of[input]});
+                    else if (is_in(in_ix, input)) m1.args.push_back(ArgInput{in_ix[input]});
+                    else if (is_in(par_ix, input)) m1.args.push_back(ArgParam{par_ix[input]});
+                    else m1.args.push_back(ArgLit{input->value});
+                    m1.args.push_back(ArgSlot{c1.out_slot});
+                    m1.out_meta = ag::jit::TensorMetadata( input->shape(), input->value.dtype(), input->value.device());
+                    m1.out_slot = plan.num_slots++;
+                    plan.steps.push_back(m1);
+                    
+                    // 3. sigmoid(1.702 * x) = 0.5 * (1 + tanh(0.5 * 1.702 * x))
+                    // We can use Op::Tanh if we implement sigmoid via tanh
+                    // Or just use a simpler approximation if Op::Sigmoid existed.
+                    // Since we have Op::Tanh: sigmoid(y) = 0.5 * (tanh(y/2) + 1)
+                    
+                    // 3.1. y/2 = 0.851 * x
+                    Step c2;
+                    c2.op = Op::Leaf;
+                    Tensor c2_t = OwnTensor::Tensor::full(Shape{{1}}, OwnTensor::TensorOptions().with_dtype(input->value.dtype()).with_device(input->value.device()), 0.851f);
+                    c2.args.push_back(ArgLit{c2_t});
+                    c2.out_meta = ag::jit::TensorMetadata( {}, input->value.dtype(), input->value.device());
+                    c2.out_slot = plan.num_slots++;
+                    plan.steps.push_back(c2);
+                    
+                    Step m2;
+                    m2.op = Op::Mul;
+                    m2.args.push_back(ArgSlot{m1.out_slot}); // This is 1.702*x, wait I need 0.851*x
+                    // Actually m1 is 1.702*x. m1/2 is 0.851*x.
+                    // Let's just use input * 0.851
+                    m2.args.clear();
+                    if (slot_of.count(input)) m2.args.push_back(ArgSlot{slot_of[input]});
+                    else if (is_in(in_ix, input)) m2.args.push_back(ArgInput{in_ix[input]});
+                    else if (is_in(par_ix, input)) m2.args.push_back(ArgParam{par_ix[input]});
+                    else m2.args.push_back(ArgLit{input->value});
+                    m2.args.push_back(ArgSlot{c2.out_slot});
+                    m2.out_meta = m1.out_meta;
+                    m2.out_slot = plan.num_slots++;
+                    plan.steps.push_back(m2);
+                    
+                    // 3.2. tanh(0.851 * x)
+                    Step t1;
+                    t1.op = Op::Tanh;
+                    t1.args.push_back(ArgSlot{m2.out_slot});
+                    t1.out_meta = m2.out_meta;
+                    t1.out_slot = plan.num_slots++;
+                    plan.steps.push_back(t1);
+                    
+                    // 3.3. tanh + 1
+                    Step c3;
+                    c3.op = Op::Leaf;
+                    Tensor c3_t = OwnTensor::Tensor::ones(Shape{{1}}, OwnTensor::TensorOptions().with_dtype(input->value.dtype()).with_device(input->value.device()));
+                    c3.args.push_back(ArgLit{c3_t});
+                    c3.out_meta = ag::jit::TensorMetadata( {}, input->value.dtype(), input->value.device());
+                    c3.out_slot = plan.num_slots++;
+                    plan.steps.push_back(c3);
+                    
+                    Step a1;
+                    a1.op = Op::Add;
+                    a1.args.push_back(ArgSlot{t1.out_slot});
+                    a1.args.push_back(ArgSlot{c3.out_slot});
+                    a1.out_meta = t1.out_meta;
+                    a1.out_slot = plan.num_slots++;
+                    plan.steps.push_back(a1);
+                    
+                    // 3.4. 0.5 * (tanh + 1)
+                    Step c4;
+                    c4.op = Op::Leaf;
+                    Tensor c4_t = OwnTensor::Tensor::full(Shape{{1}}, OwnTensor::TensorOptions().with_dtype(input->value.dtype()).with_device(input->value.device()), 0.5f);
+                    c4.args.push_back(ArgLit{c4_t});
+                    c4.out_meta = ag::jit::TensorMetadata( {}, input->value.dtype(), input->value.device());
+                    c4.out_slot = plan.num_slots++;
+                    plan.steps.push_back(c4);
+                    
+                    Step m3;
+                    m3.op = Op::Mul;
+                    m3.args.push_back(ArgSlot{a1.out_slot});
+                    m3.args.push_back(ArgSlot{c4.out_slot});
+                    m3.out_meta = a1.out_meta;
+                    m3.out_slot = plan.num_slots++;
+                    plan.steps.push_back(m3);
+                    
+                    // 4. grad * sigmoid(1.702 * x)
+                    Step final_grad;
+                    final_grad.op = Op::Mul;
+                    final_grad.args.push_back(ArgSlot{grad_slot});
+                    final_grad.args.push_back(ArgSlot{m3.out_slot});
+                    final_grad.out_meta = m3.out_meta;
+                    final_grad.out_slot = plan.num_slots++;
+                    plan.steps.push_back(final_grad);
+                    
+                    if (grad_slot_of.count(input)) {
+                        Step acc;
+                        acc.op = Op::Add;
+                        acc.args.push_back(ArgSlot{grad_slot_of[input]});
+                        acc.args.push_back(ArgSlot{final_grad.out_slot});
+                        acc.out_meta = final_grad.out_meta;
+                        acc.out_slot = plan.num_slots++;
+                        grad_slot_of[input] = acc.out_slot;
+                        plan.steps.push_back(std::move(acc));
+                    } else {
+                        grad_slot_of[input] = final_grad.out_slot;
                     }
                 }
             } else if (n->op == Op::MSELoss) {
                 Node* x = n->inputs[0].get();
                 Node* y = n->inputs[1].get();
-                int64_t N = x->value.numel();
+                int64_t N = 1;
+                for (auto d : x->shape()) N *= d;
                 
                 Step const_step;
                 const_step.op = Op::Leaf;
                 float scale = 2.0f / N;
                 Tensor scale_t = OwnTensor::Tensor::full(Shape{{1}}, OwnTensor::TensorOptions().with_dtype(x->value.dtype()).with_device(x->value.device()), scale);
                 const_step.args.push_back(ArgLit{scale_t});
-                const_step.out_meta = { {}, x->value.dtype(), x->value.device() };
+                const_step.out_meta = ag::jit::TensorMetadata( {}, x->value.dtype(), x->value.device());
                 const_step.out_slot = plan.num_slots++;
                 plan.steps.push_back(const_step);
                 int scale_slot = const_step.out_slot;
@@ -598,7 +843,7 @@ Compiled compile(const Value& output,
                 else if (is_in(par_ix, y)) sub_step.args.push_back(ArgParam{par_ix[y]});
                 else sub_step.args.push_back(ArgLit{y->value});
                 
-                sub_step.out_meta = {x->shape(), x->value.dtype(), x->value.device()};
+                sub_step.out_meta = ag::jit::TensorMetadata(x->shape(), x->value.dtype(), x->value.device());
                 sub_step.out_slot = plan.num_slots++;
                 plan.steps.push_back(sub_step);
                 int diff_slot = sub_step.out_slot;
@@ -617,10 +862,10 @@ Compiled compile(const Value& output,
                     st.op = Op::Mul;
                     st.args.push_back(ArgSlot{grad_common});
                     st.args.push_back(ArgSlot{grad_slot});
-                    st.out_meta = {x->shape(), x->value.dtype(), x->value.device()};
+                    st.out_meta = ag::jit::TensorMetadata(x->shape(), x->value.dtype(), x->value.device());
                     st.out_slot = plan.num_slots++;
                     plan.steps.push_back(std::move(st));
-                    grad_slot_of[x] = st.out_slot;
+                    accumulate_grad(x, st.out_slot);
                 }
                 
                 if (y->requires_grad()) {
@@ -628,7 +873,7 @@ Compiled compile(const Value& output,
                     neg.op = Op::Leaf; 
                      Tensor neg_one = OwnTensor::Tensor::full(Shape{{1}}, OwnTensor::TensorOptions().with_dtype(y->value.dtype()).with_device(y->value.device()), -1.0f);
                     neg.args.push_back(ArgLit{neg_one});
-                    neg.out_meta = { {}, y->value.dtype(), y->value.device() };
+                    neg.out_meta = ag::jit::TensorMetadata(std::vector<int64_t>{}, y->value.dtype(), y->value.device());
                     neg.out_slot = plan.num_slots++;
                     plan.steps.push_back(neg);
                     
@@ -636,7 +881,7 @@ Compiled compile(const Value& output,
                     st.op = Op::Mul;
                     st.args.push_back(ArgSlot{grad_common});
                     st.args.push_back(ArgSlot{neg.out_slot});
-                    st.out_meta = {y->shape(), y->value.dtype(), y->value.device()};
+                    st.out_meta = ag::jit::TensorMetadata(y->shape(), y->value.dtype(), y->value.device());
                     st.out_slot = plan.num_slots++;
                     plan.steps.push_back(st);
                     int dy_raw = st.out_slot;
@@ -645,10 +890,107 @@ Compiled compile(const Value& output,
                     final_dy.op = Op::Mul;
                     final_dy.args.push_back(ArgSlot{dy_raw});
                     final_dy.args.push_back(ArgSlot{grad_slot});
-                    final_dy.out_meta = {y->shape(), y->value.dtype(), y->value.device()};
+                    final_dy.out_meta = ag::jit::TensorMetadata(y->shape(), y->value.dtype(), y->value.device());
                     final_dy.out_slot = plan.num_slots++;
                     plan.steps.push_back(std::move(final_dy));
-                    grad_slot_of[y] = final_dy.out_slot;
+                    accumulate_grad(y, final_dy.out_slot);
+                }
+            } else if (n->op == Op::Sum) {
+                Node* input = n->inputs[0].get();
+                if (input->requires_grad()) {
+                    // dx = dz (broadcasted)
+                    Step ones_step;
+                    ones_step.op = Op::Leaf;
+                    Tensor ones = OwnTensor::Tensor::ones(Shape{input->shape()}, ag::options(input->value));
+                    ones_step.args.push_back(ArgLit{ones});
+                    ones_step.out_meta = ag::jit::TensorMetadata( input->shape(), input->value.dtype(), input->value.device());
+                    ones_step.out_slot = plan.num_slots++;
+                    plan.steps.push_back(ones_step);
+                    
+                    Step mul_step;
+                    mul_step.op = Op::Mul;
+                    mul_step.args.push_back(ArgSlot{grad_slot});
+                    mul_step.args.push_back(ArgSlot{ones_step.out_slot});
+                    mul_step.out_meta = ones_step.out_meta;
+                    mul_step.out_slot = plan.num_slots++;
+                    plan.steps.push_back(mul_step);
+                    
+                    accumulate_grad(input, mul_step.out_slot);
+                }
+            } else if (n->op == Op::MeanAll) {
+                Node* input = n->inputs[0].get();
+                if (input->requires_grad()) {
+                    int64_t N = 1;
+                    for (auto d : input->shape()) N *= d;
+                    
+                    Step scale_step;
+                    scale_step.op = Op::Leaf;
+                    Tensor scale = OwnTensor::Tensor::full(Shape{{1}}, ag::options(input->value), 1.0f / N);
+                    scale_step.args.push_back(ArgLit{scale});
+                    scale_step.out_meta = ag::jit::TensorMetadata( {1}, input->value.dtype(), input->value.device());
+                    scale_step.out_slot = plan.num_slots++;
+                    plan.steps.push_back(scale_step);
+                    
+                    Step dz_scaled;
+                    dz_scaled.op = Op::Mul;
+                    dz_scaled.args.push_back(ArgSlot{grad_slot});
+                    dz_scaled.args.push_back(ArgSlot{scale_step.out_slot});
+                    dz_scaled.out_meta = ag::jit::TensorMetadata( {1}, input->value.dtype(), input->value.device());
+                    dz_scaled.out_slot = plan.num_slots++;
+                    plan.steps.push_back(dz_scaled);
+                    
+                    Step ones_step;
+                    ones_step.op = Op::Leaf;
+                    Tensor ones = OwnTensor::Tensor::ones(Shape{input->shape()}, ag::options(input->value));
+                    ones_step.args.push_back(ArgLit{ones});
+                    ones_step.out_meta = ag::jit::TensorMetadata( input->shape(), input->value.dtype(), input->value.device());
+                    ones_step.out_slot = plan.num_slots++;
+                    plan.steps.push_back(ones_step);
+                    
+                    Step mul_step;
+                    mul_step.op = Op::Mul;
+                    mul_step.args.push_back(ArgSlot{dz_scaled.out_slot});
+                    mul_step.args.push_back(ArgSlot{ones_step.out_slot});
+                    mul_step.out_meta = ones_step.out_meta;
+                    mul_step.out_slot = plan.num_slots++;
+                    plan.steps.push_back(mul_step);
+                    
+                    accumulate_grad(input, mul_step.out_slot);
+                }
+            } else if (n->op == Op::RowSum) {
+                Node* input = n->inputs[0].get();
+                if (input->requires_grad()) {
+                    // dx = dz (broadcasted along columns)
+                    Step ones_step;
+                    ones_step.op = Op::Leaf;
+                    Tensor ones = OwnTensor::Tensor::ones(Shape{input->shape()}, ag::options(input->value));
+                    ones_step.args.push_back(ArgLit{ones});
+                    ones_step.out_meta = ag::jit::TensorMetadata(input->shape(), input->value.dtype(), input->value.device());
+                    ones_step.out_slot = plan.num_slots++;
+                    plan.steps.push_back(ones_step);
+                    
+                    Step mul_step;
+                    mul_step.op = Op::Mul;
+                    mul_step.args.push_back(ArgSlot{grad_slot});
+                    mul_step.args.push_back(ArgSlot{ones_step.out_slot});
+                    mul_step.out_meta = ones_step.out_meta;
+                    mul_step.out_slot = plan.num_slots++;
+                    plan.steps.push_back(mul_step);
+                    
+                    accumulate_grad(input, mul_step.out_slot);
+                }
+            } else if (n->op == Op::Transpose) {
+                Node* input = n->inputs[0].get();
+                if (input->requires_grad()) {
+                    // dx = dz.transpose() (assuming 2D for now)
+                    Step t_step;
+                    t_step.op = Op::Transpose;
+                    t_step.args.push_back(ArgSlot{grad_slot});
+                    t_step.out_meta = ag::jit::TensorMetadata(input->shape(), input->value.dtype(), input->value.device());
+                    t_step.out_slot = plan.num_slots++;
+                    plan.steps.push_back(t_step);
+                    
+                    accumulate_grad(input, t_step.out_slot);
                 }
             }
         }
@@ -663,7 +1005,7 @@ Compiled compile(const Value& output,
                 st.op = Op::Leaf;
                 Tensor z = OwnTensor::Tensor::zeros(p->value.shape(), ag::options(p->value));
                 st.args.push_back(ArgLit{z});
-                st.out_meta = {p->shape(), p->value.dtype(), p->value.device()};
+                st.out_meta = ag::jit::TensorMetadata(p->shape(), p->value.dtype(), p->value.device());
                 st.out_slot = plan.num_slots++;
                 plan.steps.push_back(st);
                 plan.out_slots.push_back(st.out_slot);
@@ -705,7 +1047,10 @@ Compiled compile(const Value& output,
             auto compileResult = compiler.compileString(generated_mlir_opbuilder, "", options);
             if (compileResult.success) {
                 generated_mlir_opbuilder = compileResult.output;
-                std::cout << "\n=== Optimized MLIR Generated via NovaCompilerAPI ===\n" << generated_mlir_opbuilder <<  std::endl;
+                std::cout << "=== Optimized MLIR Generated via NovaCompilerAPI ===\n";
+                std::ofstream ofs("optimized.mlir");
+                ofs << generated_mlir_opbuilder;
+                ofs.close();
             } else {
                 std::cerr << "Warning: NovaCompilerAPI pipeline failed: " << compileResult.errorMessage << "\n";
             }
@@ -725,16 +1070,12 @@ Compiled compile(const Value& output,
     // NEW: Perform AOT Compilation Immediately (Eager Compilation)
     // ===================================================================
     if (!c.mlir_source.empty()) {
-        std::cout << "\n[Compile] Starting AOT compilation...\n";
-        void* func_ptr = compileAndLoad(c.mlir_source);
+        void* dl_handle = nullptr;
+        void* func_ptr = compileAndLoad(c.mlir_source, &dl_handle);
         
         if (func_ptr) {
             c.compiled_func = func_ptr;
-            // Store the Plan metadata and original MLIR source for signature parsing
-            storeAOTContext(func_ptr, c.p->plan, c.mlir_source);
-            std::cout << "[Compile] AOT compilation successful! Function ready at " << func_ptr << "\n";
-        } else {
-            std::cerr << "[Compile] Warning: AOT compilation failed. Will fall back to interpreter.\n";
+            storeAOTContext(func_ptr, dl_handle, c.p->plan, c.mlir_source, c.aot_context);
         }
     }
 
@@ -745,63 +1086,103 @@ Compiled compile(const Value& output,
 // AOT Adapter Function
 // ===================================================================
 
-// Global storage for the compiled function and metadata
-struct AOTContext {
-    void* ciface_func = nullptr;
-    Plan plan;
-    std::string mlir_source;  // Store MLIR source for signature parsing
-};
-
-static AOTContext g_aot_context;
 
 // Generic memref descriptor builder
 // Returns a vector of bytes representing the memref descriptor
+static size_t alignTo(size_t size, size_t alignment) {
+    return (size + alignment - 1) & ~(alignment - 1);
+}
+
+std::vector<int64_t> parseTensorSpec(const std::string& tensor_spec) {
+    std::vector<int64_t> shape;
+    if (tensor_spec.find('x') == std::string::npos) return shape;
+    size_t pos = 0;
+    while (pos < tensor_spec.size()) {
+        size_t x_pos = tensor_spec.find('x', pos);
+        if (x_pos == std::string::npos) break;
+        try { shape.push_back(std::stoll(tensor_spec.substr(pos, x_pos - pos))); } catch (...) { break; }
+        pos = x_pos + 1;
+    }
+    return shape;
+}
+
+std::vector<std::vector<int64_t>> parseMLIRResultShapes(const std::string& mlir_source) {
+    std::vector<std::vector<int64_t>> result_shapes;
+    size_t arrow_pos = mlir_source.find("-> ");
+    if (arrow_pos == std::string::npos) return result_shapes;
+    size_t start = arrow_pos + 3;
+    if (mlir_source[start] == '(') {
+        size_t close_paren = mlir_source.find(')', start);
+        if (close_paren == std::string::npos) return result_shapes;
+        std::string tuple_content = mlir_source.substr(start + 1, close_paren - start - 1);
+        size_t pos = 0;
+        while (pos < tuple_content.size()) {
+            while (pos < tuple_content.size() && (tuple_content[pos] == ' ' || tuple_content[pos] == ',')) pos++;
+            size_t t_start = tuple_content.find("tensor<", pos);
+            if (t_start == std::string::npos) break;
+            size_t spec_end = tuple_content.find('>', t_start);
+            if (spec_end == std::string::npos) break;
+            result_shapes.push_back(parseTensorSpec(tuple_content.substr(t_start + 7, spec_end - t_start - 7)));
+            pos = spec_end + 1;
+        }
+    } else if (mlir_source.substr(start, 7) == "tensor<") {
+        size_t spec_end = mlir_source.find('>', start);
+        if (spec_end != std::string::npos) result_shapes.push_back(parseTensorSpec(mlir_source.substr(start + 7, spec_end - start - 7)));
+    }
+    return result_shapes;
+}
+
 std::vector<char> buildMemRefDescriptor(Tensor* tensor, const TensorMetadata& meta) {
     size_t rank = meta.shape.size();
-    
     size_t descriptor_size = sizeof(void*) * 2 + sizeof(int64_t) * (1 + 2 * rank);
     std::vector<char> descriptor(descriptor_size, 0);
-    
     char* ptr = descriptor.data();
     
-    // Write allocated pointer
-    *reinterpret_cast<void**>(ptr) = tensor->data<float>();
-    ptr += sizeof(void*);
+    // Use raw data pointer (void*)
+    void* raw_ptr = tensor->data();
     
-    // Write aligned pointer
-    *reinterpret_cast<void**>(ptr) = tensor->data<float>();
+    *reinterpret_cast<void**>(ptr) = raw_ptr;
     ptr += sizeof(void*);
-    
-    // Write offset
+    *reinterpret_cast<void**>(ptr) = raw_ptr;
+    ptr += sizeof(void*);
     *reinterpret_cast<int64_t*>(ptr) = 0;
     ptr += sizeof(int64_t);
-    
-    // Write sizes
     for (size_t i = 0; i < rank; ++i) {
         *reinterpret_cast<int64_t*>(ptr) = tensor->shape().dims[i];
         ptr += sizeof(int64_t);
     }
-    
-    // Write strides (row-major) - FIX: write strides at correct index positions
-    // For an 8x10 tensor: strides[0]=10, strides[1]=1
-    int64_t* strides_ptr = reinterpret_cast<int64_t*>(ptr);
-    int64_t stride = 1;
-    for (int i = rank - 1; i >= 0; --i) {
-        strides_ptr[i] = stride;  // Write at index i, not at advancing ptr
-        stride *= tensor->shape().dims[i];
+    for (size_t i = 0; i < rank; ++i) {
+        *reinterpret_cast<int64_t*>(ptr) = tensor->stride().strides[i];
+        ptr += sizeof(int64_t);
     }
-    
     return descriptor;
 }
 
-// Parse a single tensor spec like "8x10xf32" or "f32" (scalar)
+// Parse MLIR function signature to extract result tensor shape
 // Returns: vector of dimensions (empty for scalar)
-std::vector<int64_t> parseTensorSpec(const std::string& tensor_spec) {
-    std::vector<int64_t> shape;
+std::vector<int64_t> parseMLIRResultShape(const std::string& mlir_source) {
+    std::vector<int64_t> result_shape;
     
-    // Check if it's a scalar (just "f32" or similar type with no 'x')
+    // Find the function signature: "-> tensor<...>"
+    size_t arrow_pos = mlir_source.find("-> tensor<");
+    if (arrow_pos == std::string::npos) {
+        std::cerr << "[ABIAdapter] Warning: Could not find result tensor in MLIR signature\n";
+        return result_shape;  // Empty = scalar
+    }
+    
+    size_t start = arrow_pos + 10;  // After "-> tensor<"
+    size_t end = mlir_source.find(">", start);
+    if (end == std::string::npos) {
+        std::cerr << "[ABIAdapter] Warning: Malformed tensor signature\n";
+        return result_shape;
+    }
+    
+    std::string tensor_spec = mlir_source.substr(start, end - start);
+    
+    // Check if it's a scalar (just "f32" or similar type)
     if (tensor_spec.find('x') == std::string::npos) {
-        return shape;  // Empty = scalar
+        // Scalar - no dimensions
+        return result_shape;  // Empty vector
     }
     
     // Parse dimensions: "8x10xf32" -> [8, 10]
@@ -809,380 +1190,252 @@ std::vector<int64_t> parseTensorSpec(const std::string& tensor_spec) {
     while (pos < tensor_spec.size()) {
         size_t x_pos = tensor_spec.find('x', pos);
         if (x_pos == std::string::npos) {
-            break;  // Last part is the type
+            // Last part is the type (e.g., "f32"), not a dimension
+            break;
         }
         
         std::string dim_str = tensor_spec.substr(pos, x_pos - pos);
         try {
             int64_t dim = std::stoll(dim_str);
-            shape.push_back(dim);
+            result_shape.push_back(dim);
         } catch (...) {
+            std::cerr << "[ABIAdapter] Warning: Failed to parse dimension: " << dim_str << "\n";
             break;
         }
+        
         pos = x_pos + 1;
     }
-    return shape;
+    
+    return result_shape;
 }
 
-// Parse MLIR function signature to extract ALL result tensor shapes
-// Handles: -> (tensor<f32>, tensor<16x10xf32>, tensor<1x10xf32>)
-// Returns: vector of shapes (each shape is a vector of dimensions, empty = scalar)
-std::vector<std::vector<int64_t>> parseMLIRResultShapes(const std::string& mlir_source) {
-    std::vector<std::vector<int64_t>> result_shapes;
+extern "C" void* ABIAdapter(void** args, void* context_ptr) {
+    auto* context = static_cast<AOTContext*>(context_ptr);
+    if (!context || !context->ciface_func) return nullptr;
     
-    // Find the return type section: "-> (" or "-> tensor<"
-    size_t arrow_pos = mlir_source.find("-> ");
-    if (arrow_pos == std::string::npos) {
-        std::cerr << "[ABIAdapter] Warning: Could not find return type in MLIR signature\n";
-        return result_shapes;
-    }
-    
-    size_t start = arrow_pos + 3;  // After "-> "
-    
-    // Check if it's a tuple of results: "-> (tensor<...>, tensor<...>)"
-    if (mlir_source[start] == '(') {
-        // Multiple results - find matching closing paren
-        size_t open_paren = start;
-        size_t close_paren = mlir_source.find(')', open_paren);
-        if (close_paren == std::string::npos) {
-            std::cerr << "[ABIAdapter] Warning: Malformed tuple return type\n";
-            return result_shapes;
-        }
-        
-        std::string tuple_content = mlir_source.substr(open_paren + 1, close_paren - open_paren - 1);
-        
-        // Parse each "tensor<...>" in the tuple
-        size_t pos = 0;
-        while (pos < tuple_content.size()) {
-            // Skip whitespace
-            while (pos < tuple_content.size() && (tuple_content[pos] == ' ' || tuple_content[pos] == ',')) {
-                pos++;
-            }
-            if (pos >= tuple_content.size()) break;
-            
-            // Find "tensor<"
-            size_t tensor_start = tuple_content.find("tensor<", pos);
-            if (tensor_start == std::string::npos) break;
-            
-            size_t spec_start = tensor_start + 7;  // After "tensor<"
-            size_t spec_end = tuple_content.find('>', spec_start);
-            if (spec_end == std::string::npos) break;
-            
-            std::string spec = tuple_content.substr(spec_start, spec_end - spec_start);
-            result_shapes.push_back(parseTensorSpec(spec));
-            
-            pos = spec_end + 1;
-        }
-    } else if (mlir_source.substr(start, 7) == "tensor<") {
-        // Single result: "-> tensor<...>"
-        size_t spec_start = start + 7;
-        size_t spec_end = mlir_source.find('>', spec_start);
-        if (spec_end != std::string::npos) {
-            std::string spec = mlir_source.substr(spec_start, spec_end - spec_start);
-            result_shapes.push_back(parseTensorSpec(spec));
-        }
-    }
-    
-    std::cout << "[ABIAdapter] Parsed " << result_shapes.size() << " result shapes\n";
-    return result_shapes;
-}
-
-extern "C" void* ABIAdapter(void** args) {
-    if (!g_aot_context.ciface_func) {
-        std::cerr << "[ABIAdapter] Error: No compiled function loaded\n";
-        return nullptr;
-    }
-    
-    const Plan& plan = g_aot_context.plan;
+    const Plan& plan = context->plan;
     size_t num_inputs = plan.sig.in_meta.size();
     size_t num_params = plan.sig.param_meta.size();
-    size_t total_args = num_inputs + num_params;
     
-    std::cout << "[ABIAdapter] Generic adapter executing with " 
-              << num_inputs << " inputs, " << num_params << " params\n";
-    
-    // Build memref descriptors for all input arguments
     std::vector<std::vector<char>> input_descriptors;
-    input_descriptors.reserve(total_args);
-    
-    // Build descriptors for inputs
     for (size_t i = 0; i < num_inputs; ++i) {
-        auto* tensor = static_cast<Tensor*>(args[i]);
-        input_descriptors.push_back(buildMemRefDescriptor(tensor, plan.sig.in_meta[i]));
-        
-        std::cout << "[ABIAdapter]   Input[" << i << "]: shape=(";
-        for (size_t j = 0; j < plan.sig.in_meta[i].shape.size(); ++j) {
-            std::cout << plan.sig.in_meta[i].shape[j];
-            if (j < plan.sig.in_meta[i].shape.size() - 1) std::cout << "x";
-        }
-        std::cout << ")\n";
+        Tensor* t = static_cast<Tensor*>(args[i]);
+        input_descriptors.push_back(buildMemRefDescriptor(t, plan.sig.in_meta[i]));
     }
-    
-    // Build descriptors for params
     for (size_t i = 0; i < num_params; ++i) {
-        auto* tensor = static_cast<Tensor*>(args[num_inputs + i]);
-        input_descriptors.push_back(buildMemRefDescriptor(tensor, plan.sig.param_meta[i]));
-        
-        std::cout << "[ABIAdapter]   Param[" << i << "]: shape=(";
-        for (size_t j = 0; j < plan.sig.param_meta[i].shape.size(); ++j) {
-            std::cout << plan.sig.param_meta[i].shape[j];
-            if (j < plan.sig.param_meta[i].shape.size() - 1) std::cout << "x";
-        }
-        std::cout << ")\n";
+        Tensor* t = static_cast<Tensor*>(args[num_inputs + i]);
+        input_descriptors.push_back(buildMemRefDescriptor(t, plan.sig.param_meta[i]));
     }
     
-    // Parse MLIR signature to get ALL result shapes
-    std::vector<std::vector<int64_t>> result_shapes = parseMLIRResultShapes(g_aot_context.mlir_source);
+    std::vector<std::vector<int64_t>> result_shapes = parseMLIRResultShapes(context->mlir_source);
     size_t num_results = result_shapes.size();
     
-    std::cout << "[ABIAdapter] Number of results: " << num_results << "\n";
+    // Determine result dtypes from plan
+    std::vector<OwnTensor::Dtype> result_dtypes;
+    for (int slot : plan.out_slots) {
+        bool found = false;
+        for (const auto& step : plan.steps) {
+            if (step.out_slot == slot) {
+                result_dtypes.push_back(step.out_meta.dtype);
+                found = true;
+                break;
+            }
+        }
+        if (!found) result_dtypes.push_back(OwnTensor::Dtype::Float32); // Fallback
+    }
     
-    // Calculate the size of each result's memref descriptor and the total packed struct size
-    // MLIR memref descriptor layout:
-    // - Scalar (rank 0): { ptr, ptr, i64 } = 2 pointers + 1 i64
-    // - Rank N: { ptr, ptr, i64, array<N x i64>, array<N x i64> } = 2 pointers + 1 + 2*N i64s
-    std::vector<size_t> result_desc_sizes;
     std::vector<size_t> result_desc_offsets;
     size_t packed_struct_size = 0;
-    
     for (size_t r = 0; r < num_results; ++r) {
-        size_t result_rank = result_shapes[r].size();
-        size_t desc_size;
-        
-        if (result_rank == 0) {
-            // Scalar: 2 pointers + 1 offset
-            desc_size = sizeof(void*) * 2 + sizeof(int64_t);
-        } else {
-            // Non-scalar: 2 pointers + offset + N sizes + N strides
-            desc_size = sizeof(void*) * 2 + sizeof(int64_t) * (1 + 2 * result_rank);
-        }
-        
-        result_desc_sizes.push_back(desc_size);
+        packed_struct_size = alignTo(packed_struct_size, 8);
         result_desc_offsets.push_back(packed_struct_size);
-        packed_struct_size += desc_size;
-        
-        std::cout << "[ABIAdapter]   Result[" << r << "]: rank=" << result_rank 
-                  << ", desc_size=" << desc_size << ", offset=" << result_desc_offsets[r] << "\n";
+        packed_struct_size += sizeof(void*) * 2 + sizeof(int64_t) * (1 + 2 * result_shapes[r].size());
     }
+    packed_struct_size = alignTo(packed_struct_size, 64);
+
+    void* packed_output_raw = nullptr;
+    if (posix_memalign(&packed_output_raw, 64, packed_struct_size) != 0) {
+        return nullptr;
+    }
+    std::memset(packed_output_raw, 0, packed_struct_size);
     
-    std::cout << "[ABIAdapter] Total packed output struct size: " << packed_struct_size << " bytes\n";
-    
-    // Allocate the packed output struct and result data buffers
-    std::vector<char> packed_output(packed_struct_size, 0);
-    std::vector<void*> result_buffers(num_results);
-    
-    // Initialize each result memref descriptor within the packed struct
+    std::vector<void*> result_buffers(num_results, nullptr);
+    auto cleanup = [&]() {
+        for (void* buf : result_buffers) if (buf) std::free(buf);
+        if (packed_output_raw) std::free(packed_output_raw);
+    };
+
     for (size_t r = 0; r < num_results; ++r) {
-        size_t result_rank = result_shapes[r].size();
-        char* desc_ptr = packed_output.data() + result_desc_offsets[r];
-        
-        // Allocate buffer for result data
-        size_t buffer_size = sizeof(float);
-        for (auto dim : result_shapes[r]) {
-            buffer_size *= dim;
-        }
-        if (buffer_size == 0) buffer_size = sizeof(float);  // At least 1 element for scalar
+        size_t elem_size = getElementSize(result_dtypes[r]);
+        size_t total_elements = 1;
+        for (auto dim : result_shapes[r]) total_elements *= dim;
+        size_t buffer_size = std::max((size_t)1, total_elements) * elem_size;
         
         result_buffers[r] = std::malloc(buffer_size);
+        if (!result_buffers[r]) { cleanup(); return nullptr; }
         std::memset(result_buffers[r], 0, buffer_size);
         
-        // Set allocated and aligned pointers
+        char* desc_ptr = static_cast<char*>(packed_output_raw) + result_desc_offsets[r];
         *reinterpret_cast<void**>(desc_ptr) = result_buffers[r];
         *reinterpret_cast<void**>(desc_ptr + sizeof(void*)) = result_buffers[r];
-        *reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2) = 0;  // offset
         
-        if (result_rank > 0) {
-            // Fill in sizes and strides for non-scalar results
+        if (!result_shapes[r].empty()) {
             int64_t* sizes_ptr = reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2 + sizeof(int64_t));
-            int64_t* strides_ptr = sizes_ptr + result_rank;
-            
-            for (size_t i = 0; i < result_rank; ++i) {
-                sizes_ptr[i] = result_shapes[r][i];
-            }
-            
+            int64_t* strides_ptr = sizes_ptr + result_shapes[r].size();
+            for (size_t i = 0; i < result_shapes[r].size(); ++i) sizes_ptr[i] = result_shapes[r][i];
             int64_t stride = 1;
-            for (int i = result_rank - 1; i >= 0; --i) {
-                strides_ptr[i] = stride;
-                stride *= result_shapes[r][i];
+            for (int i = (int)result_shapes[r].size() - 1; i >= 0; --i) { 
+                strides_ptr[i] = stride; 
+                stride *= result_shapes[r][i]; 
             }
         }
     }
     
-    // Build the argument array for the C interface call
-    // Order: 1 packed output struct pointer, then N input memref pointers
-    std::vector<void*> call_args;
-    call_args.push_back(packed_output.data());  // Packed output struct
-    for (auto& desc : input_descriptors) {
-        call_args.push_back(desc.data());
-    }
+    std::vector<void*> call_args; 
+    call_args.push_back(packed_output_raw);
+    for (auto& desc : input_descriptors) call_args.push_back(desc.data());
+    while (call_args.size() < 20) call_args.push_back(nullptr);
     
-    std::cout << "[ABIAdapter] Calling compiled function with " << call_args.size() << " args (1 output + " 
-              << total_args << " inputs)...\n";
-    
-    // Call the compiled function using libffi for dynamic argument handling
-    // Since we don't have libffi set up for this, use a switch-case approach
-    // The function signature is: void func(void* output, void* in1, void* in2, ...)
-    
-    // Pad to 10 elements for safety
-    while (call_args.size() < 10) {
-        call_args.push_back(nullptr);
-    }
-    
-    using CIfaceFunc = void (*)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*);
-    
-    reinterpret_cast<CIfaceFunc>(g_aot_context.ciface_func)(
+    using CIfaceFunc = void (*)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
+                                void*, void*, void*, void*, void*, void*, void*, void*, void*, void*);
+    reinterpret_cast<CIfaceFunc>(context->ciface_func)(
         call_args[0], call_args[1], call_args[2], call_args[3], call_args[4],
-        call_args[5], call_args[6], call_args[7], call_args[8], call_args[9]
-    );
-    
-    std::cout << "[ABIAdapter] Function returned\n";
-    
-    // Extract ALL results from the packed output struct and create output tensors
+        call_args[5], call_args[6], call_args[7], call_args[8], call_args[9],
+        call_args[10], call_args[11], call_args[12], call_args[13], call_args[14],
+        call_args[15], call_args[16], call_args[17], call_args[18], call_args[19]);
+
     auto* output_tensors = new std::vector<Tensor>();
-    output_tensors->reserve(num_results);
-    
     for (size_t r = 0; r < num_results; ++r) {
-        size_t result_rank = result_shapes[r].size();
-        char* desc_ptr = packed_output.data() + result_desc_offsets[r];
-        
-        // Read the memref descriptor fields
+        char* desc_ptr = static_cast<char*>(packed_output_raw) + result_desc_offsets[r];
+        void* allocated = *reinterpret_cast<void**>(desc_ptr);
         void* aligned = *reinterpret_cast<void**>(desc_ptr + sizeof(void*));
         int64_t offset = *reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2);
         
-        std::cout << "[ABIAdapter] Extracting result " << r << " aligned=" << aligned << " offset=" << offset << "\n";
-        
         if (!aligned) {
-            std::cerr << "[ABIAdapter] Error: Invalid result " << r << " from compiled function\n";
             continue;
         }
-        
-        if (result_rank == 0) {
-            // Scalar result
-            Tensor out(OwnTensor::Shape{{1}}, OwnTensor::Dtype::Float32,
-                       OwnTensor::DeviceIndex(OwnTensor::Device::CPU), false);
-            float* data_ptr = reinterpret_cast<float*>(aligned) + offset;
-            float scalar_val = *data_ptr;
-            out.data<float>()[0] = scalar_val;
-            
-            std::cout << "[ABIAdapter]   Result[" << r << "]: scalar = " << scalar_val << "\n";
-            output_tensors->push_back(std::move(out));
-        } else {
-            // Non-scalar result - read sizes from descriptor
-            int64_t* sizes_ptr = reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2 + sizeof(int64_t));
-            std::vector<int64_t> actual_shape(sizes_ptr, sizes_ptr + result_rank);
-            
-            std::cout << "[ABIAdapter]   Result[" << r << "]: shape=(";
-            for (size_t d = 0; d < result_rank; ++d) {
-                std::cout << actual_shape[d];
-                if (d < result_rank - 1) std::cout << "x";
-            }
-            std::cout << ")\n";
-            
-            Tensor out(OwnTensor::Shape{actual_shape}, OwnTensor::Dtype::Float32,
-                       OwnTensor::DeviceIndex(OwnTensor::Device::CPU), false);
-            
-            size_t total_elements = 1;
-            for (auto dim : actual_shape) {
-                total_elements *= dim;
-            }
-            
-            float* data_ptr = reinterpret_cast<float*>(aligned) + offset;
-            std::memcpy(out.data<float>(), data_ptr, total_elements * sizeof(float));
-            output_tensors->push_back(std::move(out));
+
+        size_t rank = result_shapes[r].size();
+        int64_t* strides_ptr = reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2 + sizeof(int64_t) * (1 + rank));
+        std::vector<int64_t> actual_strides(rank);
+        for (size_t i = 0; i < rank; ++i) {
+            actual_strides[i] = strides_ptr[i];
         }
+
+        Tensor out(OwnTensor::Shape{result_shapes[r].empty() ? std::vector<int64_t>{1} : result_shapes[r]}, result_dtypes[r], OwnTensor::DeviceIndex(OwnTensor::Device::CPU), false);
+        size_t total_elements = 1; for (auto dim : result_shapes[r]) total_elements *= dim;
+        size_t elem_size = getElementSize(result_dtypes[r]);
         
-        // Free the result buffer
-        std::free(result_buffers[r]);
+        if (rank == 0 || result_shapes[r].empty()) {
+            std::memcpy(out.data(), static_cast<char*>(aligned) + (offset * elem_size), elem_size);
+        } else {
+            // Generic stride-aware copy for 1D, 2D, etc.
+            // For simplicity, let's handle up to 2D specifically and fallback to element-wise for higher ranks
+            if (rank == 1) {
+                int64_t s0 = actual_strides[0];
+                char* src = static_cast<char*>(aligned) + (offset * elem_size);
+                char* dst = static_cast<char*>(out.data());
+                for (int64_t i = 0; i < result_shapes[r][0]; ++i) {
+                    std::memcpy(dst + i * elem_size, src + i * s0 * elem_size, elem_size);
+                }
+            } else if (rank == 2) {
+                int64_t s0 = actual_strides[0];
+                int64_t s1 = actual_strides[1];
+                char* src = static_cast<char*>(aligned) + (offset * elem_size);
+                char* dst = static_cast<char*>(out.data());
+                for (int64_t i = 0; i < result_shapes[r][0]; ++i) {
+                    for (int64_t j = 0; j < result_shapes[r][1]; ++j) {
+                        std::memcpy(dst + (i * result_shapes[r][1] + j) * elem_size, 
+                                    src + (i * s0 + j * s1) * elem_size, elem_size);
+                    }
+                }
+            } else {
+                // Fallback for higher ranks (slow but correct)
+                // TODO: Implement generic multi-dim stride copy
+                std::memcpy(out.data(), static_cast<char*>(aligned) + (offset * elem_size), total_elements * elem_size);
+            }
+        }
+        output_tensors->push_back(std::move(out));
+        
+        if (allocated == result_buffers[r]) {
+            std::free(result_buffers[r]);
+            result_buffers[r] = nullptr;
+        }
     }
     
-    std::cout << "[ABIAdapter] Successfully executed, returning " << output_tensors->size() << " tensors\n";
-    
+    cleanup();
     return output_tensors;
 }
+
 
 
 // Wrapper Declaration (must be global)
 extern "C" void* LegacyInterpWrapper(void**);
 
-// Helper to compile MLIR string to Shared Object and Load it
-void* compileAndLoad(const std::string& mlir_source) {
-    std::string base_path = "/tmp/nova_jit_" + std::to_string(std::rand());
+void* compileAndLoad(const std::string& mlir_source, void** out_dl_handle) {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    std::uniform_int_distribution<uint64_t> dist;
+    
+    std::stringstream ss;
+    ss << "/tmp/nova_jit_" << std::hex << dist(gen);
+    std::string base_path = ss.str();
+    
     std::string mlir_file = base_path + ".mlir";
     std::string obj_file = base_path + ".o";
     std::string so_file = base_path + ".so";
     
-    // 1. Write MLIR to file
     {
         std::ofstream out(mlir_file);
         out << mlir_source;
         out.close();
     }
     
-    std::cout << "[NovaAOT] Compiling " << mlir_file << " to object code...\n";
-    
-        // 2. Compile to Object File using SystemAPI
     #ifndef NOVA_OPT_BIN
- 
         #define NOVA_OPT_BIN "nova-opt"
     #endif
-        std::string nova_opt = NOVA_OPT_BIN;
-        bool success = mlir::nova::NovaCompilerSystemAPI::compileToObject(mlir_file, obj_file, nova_opt);
+    std::string nova_opt = NOVA_OPT_BIN;
+    bool success = mlir::nova::NovaCompilerSystemAPI::compileToObject(mlir_file, obj_file, nova_opt);
     if (!success) {
-        std::cerr << "[NovaAOT] Compilation failed.\n";
         return nullptr;
     }
     
-    std::cout << "[NovaAOT] Linking " << obj_file << " to shared object...\n";
-    // 3. Link to Shared Object (Required for dlopen)
-    // We invoke gcc/ld to convert .o -> .so
     std::string link_cmd = "gcc -shared -fPIC -o " + so_file + " " + obj_file;
     if (system(link_cmd.c_str()) != 0) {
-        std::cerr << "[NovaAOT] Linking failed: " << link_cmd << "\n";
         return nullptr;
     }
     
-    std::cout << "[NovaAOT] Loading shared object " << so_file << "...\n";
-    // 4. Load Shared Object
     void* handle = dlopen(so_file.c_str(), RTLD_LAZY | RTLD_LOCAL);
     if (!handle) {
-        std::cerr << "[NovaAOT] dlopen failed: " << dlerror() << "\n";
         return nullptr;
     }
     
-    // 5. Get Function Pointer
-    // Default entry point for mlir-ciface is _mlir_ciface_main (if function is @main)
-    // We assume the generated MLIR has @main
+    if (out_dl_handle) *out_dl_handle = handle;
+    
     void* func_ptr = dlsym(handle, "_mlir_ciface_main");
     if (!func_ptr) {
-        // Fallback: try just "main" or "_mlir_main"
         func_ptr = dlsym(handle, "main");
     }
     
     if (!func_ptr) {
-        std::cerr << "[NovaAOT] dlsym failed: Could not find _mlir_ciface_main or main\n";
+        dlclose(handle);
+        if (out_dl_handle) *out_dl_handle = nullptr;
         return nullptr;
     }
     
-    std::cout << "[NovaAOT] Successfully loaded compiled kernel at " << func_ptr << "\n";
     return func_ptr;
 }
 
-// Helper to store AOT context (function + metadata)
-void storeAOTContext(void* func_ptr, const Plan& plan, const std::string& mlir_source) {
-    g_aot_context.ciface_func = func_ptr;
-    g_aot_context.plan = plan;
-    g_aot_context.mlir_source = mlir_source;
-    std::cout << "[NovaAOT] Stored AOT context with " 
-              << plan.sig.in_meta.size() << " inputs, "
-              << plan.sig.param_meta.size() << " params\n";
+void storeAOTContext(void* func_ptr, void* dl_handle, const Plan& plan, const std::string& mlir_source, std::shared_ptr<void>& out_context) {
+    auto ctx = std::make_shared<AOTContext>();
+    ctx->ciface_func = func_ptr;
+    ctx->dl_handle = dl_handle;
+    ctx->plan = plan;
+    ctx->mlir_source = mlir_source;
+    out_context = std::static_pointer_cast<void>(ctx);
 }
 
 // Wrapper to make the legacy 'run' look like a JIT compiled function
-// Signature: void* func(void** args)
-// args[0] = Compiled::Impl* (context)
-// args[1] = std::vector<Tensor*>* (inputs)
-// args[2] = std::vector<Tensor*>* (params)
-// Returns: Tensor* (result)
 extern "C" void* LegacyInterpWrapper(void** args) {
     auto* impl = static_cast<Compiled::Impl*>(args[0]);
     auto* inputs = static_cast<const std::vector<Tensor*>*>(args[1]);
@@ -1192,7 +1445,7 @@ extern "C" void* LegacyInterpWrapper(void** args) {
     bool success = impl->run(*inputs, *params, *out);
     if (!success) {
         delete out;
-        return nullptr; // Signal failure?
+        return nullptr;
     }
     return out;
 }
@@ -1201,46 +1454,6 @@ bool Compiled::run(const std::vector<Tensor*>& inputs,
                    const std::vector<Tensor*>& params,
                    Tensor& out) const {
     return p->run(inputs, params, out);
-}
-
-bool Compiled::run(const std::vector<Tensor*>& inputs,
-                   const std::vector<Tensor*>& params,
-                   std::vector<Tensor>& outs) const {
-    // Check if we have a pre-compiled function from compile()
-    if (!compiled_func) {
-        // Fallback to interpreter if compilation failed or wasn't attempted
-        std::cout << "[Run] No compiled function available, using interpreter...\n";
-        return p->run(inputs, params, outs);
-    }
-
-    // Execute the pre-compiled function via ABI adapter
-    std::cout << "[Run] Executing pre-compiled function...\n";
-    
-    // Prepare arguments: all inputs first, then all params
-    std::vector<void*> exec_inputs;
-    for (auto* t : inputs) {
-        exec_inputs.push_back(t);
-    }
-    for (auto* t : params) {
-        exec_inputs.push_back(t);
-    }
-    
-    // Call the ABI adapter directly - now returns vector<Tensor>*
-    auto* result_tensors = static_cast<std::vector<Tensor>*>(ABIAdapter(exec_inputs.data()));
-    
-    if (!result_tensors || result_tensors->empty()) {
-        std::cerr << "[Run] Error: ABI adapter returned null or empty\n";
-        delete result_tensors;
-        return false;
-    }
-
-    // Move all results to output vector
-    std::cout << "[Run] ABI adapter returned " << result_tensors->size() << " tensors\n";
-    for (auto& tensor : *result_tensors) {
-        outs.push_back(std::move(tensor));
-    }
-    delete result_tensors;
-    return true;
 }
 
 const std::string& Compiled::getMLIRSource() const {
@@ -1255,6 +1468,45 @@ void* Compiled::getMLIRModule() const {
         }
     }
     return nullptr;
+}
+
+bool Compiled::run(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& params, std::vector<Tensor>& outs) const {
+    if (!compiled_func) return p->run(inputs, params, outs);
+    
+    // Ensure all inputs and params are contiguous for JIT execution
+    std::vector<Tensor> contiguous_inputs;
+    std::vector<Tensor*> final_inputs;
+    for (auto* t : inputs) {
+        if (!t->is_contiguous()) {
+            contiguous_inputs.push_back(t->contiguous());
+            final_inputs.push_back(&contiguous_inputs.back());
+        } else {
+            final_inputs.push_back(t);
+        }
+    }
+    
+    std::vector<Tensor> contiguous_params;
+    std::vector<Tensor*> final_params;
+    for (auto* t : params) {
+        if (!t->is_contiguous()) {
+            contiguous_params.push_back(t->contiguous());
+            final_params.push_back(&contiguous_params.back());
+        } else {
+            final_params.push_back(t);
+        }
+    }
+
+    std::vector<void*> exec_inputs; 
+    exec_inputs.reserve(final_inputs.size() + final_params.size());
+    for (auto* t : final_inputs) exec_inputs.push_back(t); 
+    for (auto* t : final_params) exec_inputs.push_back(t);
+    
+    auto* result_tensors = static_cast<std::vector<Tensor>*>(ABIAdapter(exec_inputs.data(), aot_context.get()));
+    if (!result_tensors) return false;
+    
+    for (auto& tensor : *result_tensors) outs.push_back(std::move(tensor));
+    delete result_tensors; 
+    return true;
 }
 
 } // namespace ag::jit
