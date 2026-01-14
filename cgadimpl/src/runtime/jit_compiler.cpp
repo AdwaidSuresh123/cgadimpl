@@ -705,7 +705,7 @@ Compiled compile(const Value& output,
             auto compileResult = compiler.compileString(generated_mlir_opbuilder, "", options);
             if (compileResult.success) {
                 generated_mlir_opbuilder = compileResult.output;
-                std::cout << "\n=== Optimized MLIR Generated via NovaCompilerAPI ===\n" <<  std::endl;
+                std::cout << "\n=== Optimized MLIR Generated via NovaCompilerAPI ===\n" << generated_mlir_opbuilder <<  std::endl;
             } else {
                 std::cerr << "Warning: NovaCompilerAPI pipeline failed: " << compileResult.errorMessage << "\n";
             }
@@ -782,42 +782,26 @@ std::vector<char> buildMemRefDescriptor(Tensor* tensor, const TensorMetadata& me
         ptr += sizeof(int64_t);
     }
     
-    // Write strides (row-major)
+    // Write strides (row-major) - FIX: write strides at correct index positions
+    // For an 8x10 tensor: strides[0]=10, strides[1]=1
+    int64_t* strides_ptr = reinterpret_cast<int64_t*>(ptr);
     int64_t stride = 1;
     for (int i = rank - 1; i >= 0; --i) {
-        *reinterpret_cast<int64_t*>(ptr) = stride;
-        ptr += sizeof(int64_t);
+        strides_ptr[i] = stride;  // Write at index i, not at advancing ptr
         stride *= tensor->shape().dims[i];
     }
     
     return descriptor;
 }
 
-// Parse MLIR function signature to extract result tensor shape
+// Parse a single tensor spec like "8x10xf32" or "f32" (scalar)
 // Returns: vector of dimensions (empty for scalar)
-std::vector<int64_t> parseMLIRResultShape(const std::string& mlir_source) {
-    std::vector<int64_t> result_shape;
+std::vector<int64_t> parseTensorSpec(const std::string& tensor_spec) {
+    std::vector<int64_t> shape;
     
-    // Find the function signature: "-> tensor<...>"
-    size_t arrow_pos = mlir_source.find("-> tensor<");
-    if (arrow_pos == std::string::npos) {
-        std::cerr << "[ABIAdapter] Warning: Could not find result tensor in MLIR signature\n";
-        return result_shape;  // Empty = scalar
-    }
-    
-    size_t start = arrow_pos + 10;  // After "-> tensor<"
-    size_t end = mlir_source.find(">", start);
-    if (end == std::string::npos) {
-        std::cerr << "[ABIAdapter] Warning: Malformed tensor signature\n";
-        return result_shape;
-    }
-    
-    std::string tensor_spec = mlir_source.substr(start, end - start);
-    
-    // Check if it's a scalar (just "f32" or similar type)
+    // Check if it's a scalar (just "f32" or similar type with no 'x')
     if (tensor_spec.find('x') == std::string::npos) {
-        // Scalar - no dimensions
-        return result_shape;  // Empty vector
+        return shape;  // Empty = scalar
     }
     
     // Parse dimensions: "8x10xf32" -> [8, 10]
@@ -825,23 +809,82 @@ std::vector<int64_t> parseMLIRResultShape(const std::string& mlir_source) {
     while (pos < tensor_spec.size()) {
         size_t x_pos = tensor_spec.find('x', pos);
         if (x_pos == std::string::npos) {
-            // Last part is the type (e.g., "f32"), not a dimension
-            break;
+            break;  // Last part is the type
         }
         
         std::string dim_str = tensor_spec.substr(pos, x_pos - pos);
         try {
             int64_t dim = std::stoll(dim_str);
-            result_shape.push_back(dim);
+            shape.push_back(dim);
         } catch (...) {
-            std::cerr << "[ABIAdapter] Warning: Failed to parse dimension: " << dim_str << "\n";
             break;
         }
-        
         pos = x_pos + 1;
     }
+    return shape;
+}
+
+// Parse MLIR function signature to extract ALL result tensor shapes
+// Handles: -> (tensor<f32>, tensor<16x10xf32>, tensor<1x10xf32>)
+// Returns: vector of shapes (each shape is a vector of dimensions, empty = scalar)
+std::vector<std::vector<int64_t>> parseMLIRResultShapes(const std::string& mlir_source) {
+    std::vector<std::vector<int64_t>> result_shapes;
     
-    return result_shape;
+    // Find the return type section: "-> (" or "-> tensor<"
+    size_t arrow_pos = mlir_source.find("-> ");
+    if (arrow_pos == std::string::npos) {
+        std::cerr << "[ABIAdapter] Warning: Could not find return type in MLIR signature\n";
+        return result_shapes;
+    }
+    
+    size_t start = arrow_pos + 3;  // After "-> "
+    
+    // Check if it's a tuple of results: "-> (tensor<...>, tensor<...>)"
+    if (mlir_source[start] == '(') {
+        // Multiple results - find matching closing paren
+        size_t open_paren = start;
+        size_t close_paren = mlir_source.find(')', open_paren);
+        if (close_paren == std::string::npos) {
+            std::cerr << "[ABIAdapter] Warning: Malformed tuple return type\n";
+            return result_shapes;
+        }
+        
+        std::string tuple_content = mlir_source.substr(open_paren + 1, close_paren - open_paren - 1);
+        
+        // Parse each "tensor<...>" in the tuple
+        size_t pos = 0;
+        while (pos < tuple_content.size()) {
+            // Skip whitespace
+            while (pos < tuple_content.size() && (tuple_content[pos] == ' ' || tuple_content[pos] == ',')) {
+                pos++;
+            }
+            if (pos >= tuple_content.size()) break;
+            
+            // Find "tensor<"
+            size_t tensor_start = tuple_content.find("tensor<", pos);
+            if (tensor_start == std::string::npos) break;
+            
+            size_t spec_start = tensor_start + 7;  // After "tensor<"
+            size_t spec_end = tuple_content.find('>', spec_start);
+            if (spec_end == std::string::npos) break;
+            
+            std::string spec = tuple_content.substr(spec_start, spec_end - spec_start);
+            result_shapes.push_back(parseTensorSpec(spec));
+            
+            pos = spec_end + 1;
+        }
+    } else if (mlir_source.substr(start, 7) == "tensor<") {
+        // Single result: "-> tensor<...>"
+        size_t spec_start = start + 7;
+        size_t spec_end = mlir_source.find('>', spec_start);
+        if (spec_end != std::string::npos) {
+            std::string spec = mlir_source.substr(spec_start, spec_end - spec_start);
+            result_shapes.push_back(parseTensorSpec(spec));
+        }
+    }
+    
+    std::cout << "[ABIAdapter] Parsed " << result_shapes.size() << " result shapes\n";
+    return result_shapes;
 }
 
 extern "C" void* ABIAdapter(void** args) {
@@ -858,14 +901,14 @@ extern "C" void* ABIAdapter(void** args) {
     std::cout << "[ABIAdapter] Generic adapter executing with " 
               << num_inputs << " inputs, " << num_params << " params\n";
     
-    // Build memref descriptors for all arguments
-    std::vector<std::vector<char>> descriptors;
-    descriptors.reserve(total_args);
+    // Build memref descriptors for all input arguments
+    std::vector<std::vector<char>> input_descriptors;
+    input_descriptors.reserve(total_args);
     
     // Build descriptors for inputs
     for (size_t i = 0; i < num_inputs; ++i) {
         auto* tensor = static_cast<Tensor*>(args[i]);
-        descriptors.push_back(buildMemRefDescriptor(tensor, plan.sig.in_meta[i]));
+        input_descriptors.push_back(buildMemRefDescriptor(tensor, plan.sig.in_meta[i]));
         
         std::cout << "[ABIAdapter]   Input[" << i << "]: shape=(";
         for (size_t j = 0; j < plan.sig.in_meta[i].shape.size(); ++j) {
@@ -878,7 +921,7 @@ extern "C" void* ABIAdapter(void** args) {
     // Build descriptors for params
     for (size_t i = 0; i < num_params; ++i) {
         auto* tensor = static_cast<Tensor*>(args[num_inputs + i]);
-        descriptors.push_back(buildMemRefDescriptor(tensor, plan.sig.param_meta[i]));
+        input_descriptors.push_back(buildMemRefDescriptor(tensor, plan.sig.param_meta[i]));
         
         std::cout << "[ABIAdapter]   Param[" << i << "]: shape=(";
         for (size_t j = 0; j < plan.sig.param_meta[i].shape.size(); ++j) {
@@ -888,179 +931,173 @@ extern "C" void* ABIAdapter(void** args) {
         std::cout << ")\n";
     }
     
-    // Parse MLIR signature to get result shape
-    std::vector<int64_t> result_shape = parseMLIRResultShape(g_aot_context.mlir_source);
-    size_t result_rank = result_shape.size();
+    // Parse MLIR signature to get ALL result shapes
+    std::vector<std::vector<int64_t>> result_shapes = parseMLIRResultShapes(g_aot_context.mlir_source);
+    size_t num_results = result_shapes.size();
     
-    std::cout << "[ABIAdapter] Result shape from MLIR: ";
-    if (result_rank == 0) {
-        std::cout << "scalar";
-    } else {
-        std::cout << "(";
-        for (size_t i = 0; i < result_rank; ++i) {
-            std::cout << result_shape[i];
-            if (i < result_rank - 1) std::cout << "x";
-        }
-        std::cout << ")";
-    }
-    std::cout << "\n";
+    std::cout << "[ABIAdapter] Number of results: " << num_results << "\n";
     
-    // Allocate result descriptor based on parsed rank
-    std::vector<char> result_descriptor;
-    void* result_buffer = nullptr;
-    size_t result_buffer_size = 0;
+    // Calculate the size of each result's memref descriptor and the total packed struct size
+    // MLIR memref descriptor layout:
+    // - Scalar (rank 0): { ptr, ptr, i64 } = 2 pointers + 1 i64
+    // - Rank N: { ptr, ptr, i64, array<N x i64>, array<N x i64> } = 2 pointers + 1 + 2*N i64s
+    std::vector<size_t> result_desc_sizes;
+    std::vector<size_t> result_desc_offsets;
+    size_t packed_struct_size = 0;
     
-    if (result_rank == 0) {
-        // Scalar: 2 pointers + offset
-        result_descriptor.resize(sizeof(void*) * 2 + sizeof(int64_t), 0);
-        // Allocate buffer for scalar result (1 float)
-        result_buffer_size = sizeof(float);
-        result_buffer = std::malloc(result_buffer_size);
-        std::memset(result_buffer, 0, result_buffer_size);
+    for (size_t r = 0; r < num_results; ++r) {
+        size_t result_rank = result_shapes[r].size();
+        size_t desc_size;
         
-        // Populate descriptor
-        char* desc_ptr = result_descriptor.data();
-        *reinterpret_cast<void**>(desc_ptr) = result_buffer;  // allocated
-        *reinterpret_cast<void**>(desc_ptr + sizeof(void*)) = result_buffer;  // aligned
+        if (result_rank == 0) {
+            // Scalar: 2 pointers + 1 offset
+            desc_size = sizeof(void*) * 2 + sizeof(int64_t);
+        } else {
+            // Non-scalar: 2 pointers + offset + N sizes + N strides
+            desc_size = sizeof(void*) * 2 + sizeof(int64_t) * (1 + 2 * result_rank);
+        }
+        
+        result_desc_sizes.push_back(desc_size);
+        result_desc_offsets.push_back(packed_struct_size);
+        packed_struct_size += desc_size;
+        
+        std::cout << "[ABIAdapter]   Result[" << r << "]: rank=" << result_rank 
+                  << ", desc_size=" << desc_size << ", offset=" << result_desc_offsets[r] << "\n";
+    }
+    
+    std::cout << "[ABIAdapter] Total packed output struct size: " << packed_struct_size << " bytes\n";
+    
+    // Allocate the packed output struct and result data buffers
+    std::vector<char> packed_output(packed_struct_size, 0);
+    std::vector<void*> result_buffers(num_results);
+    
+    // Initialize each result memref descriptor within the packed struct
+    for (size_t r = 0; r < num_results; ++r) {
+        size_t result_rank = result_shapes[r].size();
+        char* desc_ptr = packed_output.data() + result_desc_offsets[r];
+        
+        // Allocate buffer for result data
+        size_t buffer_size = sizeof(float);
+        for (auto dim : result_shapes[r]) {
+            buffer_size *= dim;
+        }
+        if (buffer_size == 0) buffer_size = sizeof(float);  // At least 1 element for scalar
+        
+        result_buffers[r] = std::malloc(buffer_size);
+        std::memset(result_buffers[r], 0, buffer_size);
+        
+        // Set allocated and aligned pointers
+        *reinterpret_cast<void**>(desc_ptr) = result_buffers[r];
+        *reinterpret_cast<void**>(desc_ptr + sizeof(void*)) = result_buffers[r];
         *reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2) = 0;  // offset
-    } else {
-        // Non-scalar: 2 pointers + offset + rank sizes + rank strides
-        size_t desc_size = sizeof(void*) * 2 + sizeof(int64_t) * (1 + 2 * result_rank);
-        result_descriptor.resize(desc_size, 0);
         
-        // Calculate buffer size from result shape
-        result_buffer_size = sizeof(float);
-        for (auto dim : result_shape) {
-            result_buffer_size *= dim;
-        }
-        result_buffer = std::malloc(result_buffer_size);
-        std::memset(result_buffer, 0, result_buffer_size);
-        
-        // Populate descriptor
-        char* desc_ptr = result_descriptor.data();
-        *reinterpret_cast<void**>(desc_ptr) = result_buffer;  // allocated
-        *reinterpret_cast<void**>(desc_ptr + sizeof(void*)) = result_buffer;  // aligned
-        *reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2) = 0;  // offset
-        
-        // Fill in sizes and strides
-        int64_t* sizes_ptr = reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2 + sizeof(int64_t));
-        int64_t* strides_ptr = sizes_ptr + result_rank;
-        
-        for (size_t i = 0; i < result_rank; ++i) {
-            sizes_ptr[i] = result_shape[i];
-        }
-        
-        // Calculate strides (row-major)
-        int64_t stride = 1;
-        for (int i = result_rank - 1; i >= 0; --i) {
-            strides_ptr[i] = stride;
-            stride *= result_shape[i];
+        if (result_rank > 0) {
+            // Fill in sizes and strides for non-scalar results
+            int64_t* sizes_ptr = reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2 + sizeof(int64_t));
+            int64_t* strides_ptr = sizes_ptr + result_rank;
+            
+            for (size_t i = 0; i < result_rank; ++i) {
+                sizes_ptr[i] = result_shapes[r][i];
+            }
+            
+            int64_t stride = 1;
+            for (int i = result_rank - 1; i >= 0; --i) {
+                strides_ptr[i] = stride;
+                stride *= result_shapes[r][i];
+            }
         }
     }
     
-    // Build array of descriptor pointers for the C interface call
-    std::vector<void*> descriptor_ptrs;
-    descriptor_ptrs.reserve(total_args + 1);
-    descriptor_ptrs.push_back(result_descriptor.data());  // Result is first argument
-    for (auto& desc : descriptors) {
-        descriptor_ptrs.push_back(desc.data());
+    // Build the argument array for the C interface call
+    // Order: 1 packed output struct pointer, then N input memref pointers
+    std::vector<void*> call_args;
+    call_args.push_back(packed_output.data());  // Packed output struct
+    for (auto& desc : input_descriptors) {
+        call_args.push_back(desc.data());
     }
     
-    std::cout << "[ABIAdapter] Calling compiled function...\n";
+    std::cout << "[ABIAdapter] Calling compiled function with " << call_args.size() << " args (1 output + " 
+              << total_args << " inputs)...\n";
     
-    // Call the compiled function using variadic approach
-    using CIfaceFunc1 = void (*)(void*);
-    using CIfaceFunc2 = void (*)(void*, void*);
-    using CIfaceFunc3 = void (*)(void*, void*, void*);
-    using CIfaceFunc4 = void (*)(void*, void*, void*, void*);
-    using CIfaceFunc5 = void (*)(void*, void*, void*, void*, void*);
+    // Call the compiled function using libffi for dynamic argument handling
+    // Since we don't have libffi set up for this, use a switch-case approach
+    // The function signature is: void func(void* output, void* in1, void* in2, ...)
     
-    switch (descriptor_ptrs.size()) {
-        case 1:
-            reinterpret_cast<CIfaceFunc1>(g_aot_context.ciface_func)(descriptor_ptrs[0]);
-            break;
-        case 2:
-            reinterpret_cast<CIfaceFunc2>(g_aot_context.ciface_func)(descriptor_ptrs[0], descriptor_ptrs[1]);
-            break;
-        case 3:
-            reinterpret_cast<CIfaceFunc3>(g_aot_context.ciface_func)(descriptor_ptrs[0], descriptor_ptrs[1], descriptor_ptrs[2]);
-            break;
-        case 4:
-            reinterpret_cast<CIfaceFunc4>(g_aot_context.ciface_func)(descriptor_ptrs[0], descriptor_ptrs[1], descriptor_ptrs[2], descriptor_ptrs[3]);
-            break;
-        case 5:
-            reinterpret_cast<CIfaceFunc5>(g_aot_context.ciface_func)(descriptor_ptrs[0], descriptor_ptrs[1], descriptor_ptrs[2], descriptor_ptrs[3], descriptor_ptrs[4]);
-            break;
-        default:
-            std::cerr << "[ABIAdapter] Error: Unsupported number of arguments: " << descriptor_ptrs.size() << "\n";
-            return nullptr;
+    // Pad to 10 elements for safety
+    while (call_args.size() < 10) {
+        call_args.push_back(nullptr);
     }
+    
+    using CIfaceFunc = void (*)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*);
+    
+    reinterpret_cast<CIfaceFunc>(g_aot_context.ciface_func)(
+        call_args[0], call_args[1], call_args[2], call_args[3], call_args[4],
+        call_args[5], call_args[6], call_args[7], call_args[8], call_args[9]
+    );
     
     std::cout << "[ABIAdapter] Function returned\n";
     
-    // Extract result from descriptor
-    char* result_ptr = result_descriptor.data();
-    void* allocated = *reinterpret_cast<void**>(result_ptr);
-    void* aligned = *reinterpret_cast<void**>(result_ptr + sizeof(void*));
-    int64_t offset = *reinterpret_cast<int64_t*>(result_ptr + sizeof(void*) * 2);
+    // Extract ALL results from the packed output struct and create output tensors
+    auto* output_tensors = new std::vector<Tensor>();
+    output_tensors->reserve(num_results);
     
-    if (!aligned) {
-        std::cerr << "[ABIAdapter] Error: Invalid result from compiled function\n";
-        return nullptr;
-    }
-    
-    // Create output tensor based on result rank
-    Tensor* out;
-    if (result_rank == 0) {
-        // Scalar result
-        out = new Tensor(
-            OwnTensor::Shape{{1}},
-            OwnTensor::Dtype::Float32,
-            OwnTensor::DeviceIndex(OwnTensor::Device::CPU),
-            false
-        );
+    for (size_t r = 0; r < num_results; ++r) {
+        size_t result_rank = result_shapes[r].size();
+        char* desc_ptr = packed_output.data() + result_desc_offsets[r];
         
-        float* data_ptr = reinterpret_cast<float*>(aligned) + offset;
-        out->data<float>()[0] = *data_ptr;
-    } else {
-        // Non-scalar result - extract actual sizes from descriptor
-        int64_t* sizes_ptr = reinterpret_cast<int64_t*>(result_ptr + sizeof(void*) * 2 + sizeof(int64_t));
-        std::vector<int64_t> actual_shape(sizes_ptr, sizes_ptr + result_rank);
+        // Read the memref descriptor fields
+        void* aligned = *reinterpret_cast<void**>(desc_ptr + sizeof(void*));
+        int64_t offset = *reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2);
         
-        out = new Tensor(
-            OwnTensor::Shape{actual_shape},
-            OwnTensor::Dtype::Float32,
-            OwnTensor::DeviceIndex(OwnTensor::Device::CPU),
-            false
-        );
+        std::cout << "[ABIAdapter] Extracting result " << r << " aligned=" << aligned << " offset=" << offset << "\n";
         
-        // Calculate total elements
-        size_t total_elements = 1;
-        for (auto dim : actual_shape) {
-            total_elements *= dim;
+        if (!aligned) {
+            std::cerr << "[ABIAdapter] Error: Invalid result " << r << " from compiled function\n";
+            continue;
         }
         
-        // Copy data
-        float* data_ptr = reinterpret_cast<float*>(aligned) + offset;
-        std::memcpy(out->data<float>(), data_ptr, total_elements * sizeof(float));
-    }
-    
-    std::free(allocated);
-    
-    std::cout << "[ABIAdapter] Successfully executed, result: ";
-    if (result_rank == 0) {
-        std::cout << "scalar value = " << out->data<float>()[0];
-    } else {
-        std::cout << "tensor shape (";
-        for (size_t i = 0; i < result_rank; ++i) {
-            std::cout << out->shape().dims[i];
-            if (i < result_rank - 1) std::cout << "x";
+        if (result_rank == 0) {
+            // Scalar result
+            Tensor out(OwnTensor::Shape{{1}}, OwnTensor::Dtype::Float32,
+                       OwnTensor::DeviceIndex(OwnTensor::Device::CPU), false);
+            float* data_ptr = reinterpret_cast<float*>(aligned) + offset;
+            float scalar_val = *data_ptr;
+            out.data<float>()[0] = scalar_val;
+            
+            std::cout << "[ABIAdapter]   Result[" << r << "]: scalar = " << scalar_val << "\n";
+            output_tensors->push_back(std::move(out));
+        } else {
+            // Non-scalar result - read sizes from descriptor
+            int64_t* sizes_ptr = reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2 + sizeof(int64_t));
+            std::vector<int64_t> actual_shape(sizes_ptr, sizes_ptr + result_rank);
+            
+            std::cout << "[ABIAdapter]   Result[" << r << "]: shape=(";
+            for (size_t d = 0; d < result_rank; ++d) {
+                std::cout << actual_shape[d];
+                if (d < result_rank - 1) std::cout << "x";
+            }
+            std::cout << ")\n";
+            
+            Tensor out(OwnTensor::Shape{actual_shape}, OwnTensor::Dtype::Float32,
+                       OwnTensor::DeviceIndex(OwnTensor::Device::CPU), false);
+            
+            size_t total_elements = 1;
+            for (auto dim : actual_shape) {
+                total_elements *= dim;
+            }
+            
+            float* data_ptr = reinterpret_cast<float*>(aligned) + offset;
+            std::memcpy(out.data<float>(), data_ptr, total_elements * sizeof(float));
+            output_tensors->push_back(std::move(out));
         }
-        std::cout << "), first value = " << out->data<float>()[0];
+        
+        // Free the result buffer
+        std::free(result_buffers[r]);
     }
-    std::cout << "\n";
     
-    return out;
+    std::cout << "[ABIAdapter] Successfully executed, returning " << output_tensors->size() << " tensors\n";
+    
+    return output_tensors;
 }
 
 
@@ -1188,19 +1225,21 @@ bool Compiled::run(const std::vector<Tensor*>& inputs,
         exec_inputs.push_back(t);
     }
     
-    // Call the ABI adapter directly 
-    Tensor* result_tensor = static_cast<Tensor*>(ABIAdapter(exec_inputs.data()));
+    // Call the ABI adapter directly - now returns vector<Tensor>*
+    auto* result_tensors = static_cast<std::vector<Tensor>*>(ABIAdapter(exec_inputs.data()));
     
-    if (!result_tensor) {
-        std::cerr << "[Run] Error: ABI adapter returned null\n";
+    if (!result_tensors || result_tensors->empty()) {
+        std::cerr << "[Run] Error: ABI adapter returned null or empty\n";
+        delete result_tensors;
         return false;
     }
 
-    // Move result to output
-    // Note: AOT currently returns single tensor, but we expect vector.
-    // Pushing back for now.
-    outs.push_back(std::move(*result_tensor));
-    delete result_tensor;
+    // Move all results to output vector
+    std::cout << "[Run] ABI adapter returned " << result_tensors->size() << " tensors\n";
+    for (auto& tensor : *result_tensors) {
+        outs.push_back(std::move(tensor));
+    }
+    delete result_tensors;
     return true;
 }
 

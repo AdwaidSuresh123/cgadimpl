@@ -81,7 +81,7 @@ int main() {
     std::cout << "Compiled Loss: " << compiled_loss << "\n";
 
     if (std::abs(eager_loss - compiled_loss) < 1e-4f) {
-        std::cout << "✅ PASS: Loss matches.\n";
+        std::cout << " PASS: Loss matches.\n";
     } else {
         std::cout << "❌ FAIL: Loss mismatch.\n";
     }
@@ -120,9 +120,9 @@ int main() {
     }
     
     if (grads_match) {
-        std::cout << "✅ PASS: Gradients match.\n";
+        std::cout << "PASS: Gradients match.\n";
     } else {
-        std::cout << "❌ FAIL: Gradient mismatch.\n";
+        std::cout << "FAIL: Gradient mismatch.\n";
     }
 
     return 0;
