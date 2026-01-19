@@ -1291,18 +1291,16 @@ extern "C" void* ABIAdapter(void** args, void* context_ptr) {
         }
     }
     
-    std::vector<void*> call_args; 
-    call_args.push_back(packed_output_raw);
-    for (auto& desc : input_descriptors) call_args.push_back(desc.data());
-    while (call_args.size() < 20) call_args.push_back(nullptr);
+    // Build array of descriptor pointers for dynamic calling
+    // The wrapper function takes (result_ptr, args_array) and unpacks internally
+    std::vector<void*> desc_ptrs;
+    for (auto& desc : input_descriptors) {
+        desc_ptrs.push_back(desc.data());
+    }
     
-    using CIfaceFunc = void (*)(void*, void*, void*, void*, void*, void*, void*, void*, void*, void*,
-                                void*, void*, void*, void*, void*, void*, void*, void*, void*, void*);
-    reinterpret_cast<CIfaceFunc>(context->ciface_func)(
-        call_args[0], call_args[1], call_args[2], call_args[3], call_args[4],
-        call_args[5], call_args[6], call_args[7], call_args[8], call_args[9],
-        call_args[10], call_args[11], call_args[12], call_args[13], call_args[14],
-        call_args[15], call_args[16], call_args[17], call_args[18], call_args[19]);
+    // Dynamic call: 2 fixed arguments, unlimited descriptors in array
+    using CIfaceFunc = void (*)(void*, void**);
+    reinterpret_cast<CIfaceFunc>(context->ciface_func)(packed_output_raw, desc_ptrs.data());
 
     auto* output_tensors = new std::vector<Tensor>();
     for (size_t r = 0; r < num_results; ++r) {
