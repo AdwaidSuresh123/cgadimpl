@@ -46,14 +46,14 @@ mlir::RankedTensorType MLIREmitter::createTensorType(
     OwnTensor::DeviceIndex device
 ) {
     auto elemType = dtypeToMLIRType(builder, dtype);
-    if(device.is_cuda()){  
-    std::string deviceStr = "1"; 
-    auto deviceAttr = ::mlir::nova::NovaDeviceAttr::get(
-        builder.getContext(), 
-        builder.getStringAttr(deviceStr)
-    );
-    return mlir::RankedTensorType::get(shape, elemType, deviceAttr);
-}
+    if (device.is_cuda()) {
+        std::string deviceStr = std::to_string(device.index);
+        auto deviceAttr = ::mlir::nova::NovaDeviceAttr::get(
+            builder.getContext(), 
+            builder.getStringAttr(deviceStr)
+        );
+        return mlir::RankedTensorType::get(shape, elemType, deviceAttr);
+    }
 return mlir::RankedTensorType::get(shape, elemType);
 
 }
@@ -76,6 +76,7 @@ MLIREmitter::emitModule(const Plan& plan) {
 
     // Create module
     auto module = mlir::ModuleOp::create(loc);
+    module->setAttr("nova.num_inputs", builder.getI64IntegerAttr(plan.sig.in_meta.size()));
     builder.setInsertionPointToEnd(module.getBody());
 
     // Build function signature
@@ -108,30 +109,7 @@ MLIREmitter::emitModule(const Plan& plan) {
         const auto& meta = slotMetaMap[slot];
         auto shape = meta.shape;
         
-        // Total reduction rank adjustment logic (simplified check)
-        // Note: This logic was previously checking the LAST step's op. 
-        // Now we need to check the step that produced THIS slot.
-        // We can find the step by iterating.
-        bool is_scalar_reduction = false;
-        for (const auto& step : plan.steps) {
-            if (step.out_slot == slot) {
-                if ((step.op == Op::Sum || step.op == Op::MeanAll ||
-                     step.op == Op::MSELoss || step.op == Op::MAELoss ||
-                     step.op == Op::BinaryCrossEntropy || step.op == Op::CategoricalCrossEntropy ||
-                     step.op == Op::SparseCeWithLogits || step.op == Op::CeWithLogits ||
-                     step.op == Op::KLDivergence) && 
-                    shape.size() == 1 && shape[0] == 1) {
-                    is_scalar_reduction = true;
-                }
-                break;
-            }
-        }
-        
-        if (is_scalar_reduction) {
-            shape = {};
-        }
-        
-        outputTypes.push_back(createTensorType(builder, shape, meta.dtype, meta.device));
+        outputTypes.push_back(createTensorType(builder, meta.shape, meta.dtype, meta.device));
     }
 
     // Create function type
@@ -310,102 +288,116 @@ MLIREmitter::emitModule(const Plan& plan) {
 
 
 
-            case Op::Sum:
+            case Op::Sum: {
                 if (operands.size() == 1) {
                     // Sum all dimensions - Nova expects rank-0 for total reduction if keepdims=false
-                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
                     result = builder.create<mlir::nova::ReduceOp>(
                         loc,
                         mlir::nova::ReductionKind::SUM,
                         operands[0],
-                        scalarType,
+                        resultType,
                         /*keepdims=*/false,
                         /*dimension=*/llvm::ArrayRef<int64_t>{},
                         /*ignore_nan=*/false
                     ).getResult();
                 }
                 break;
+            }
 
-            case Op::RowSum:
+            case Op::RowSum: {
                 if (operands.size() == 1) {
-                    // Reduce along axis 1
+                    auto inputType = cast<mlir::RankedTensorType>(operands[0].getType());
+                    auto rowSumType = mlir::RankedTensorType::get(resultType.getShape(), resultType.getElementType(), inputType.getEncoding());
                     result = builder.create<mlir::nova::ReduceOp>(
                         loc,
                         mlir::nova::ReductionKind::SUM,
                         operands[0],
-                        resultType,
+                        rowSumType,
                         /*keepdims=*/true,
                         llvm::ArrayRef<int64_t>{1},
                         /*ignore_nan=*/false
                     ).getResult();
                 }
                 break;
+            }
 
-            case Op::RowMax:
+            case Op::RowMax: {
                 if (operands.size() == 1) {
-                    // Reduce along axis 1
+                    auto inputType = cast<mlir::RankedTensorType>(operands[0].getType());
+                    auto rowMaxType = mlir::RankedTensorType::get(resultType.getShape(), resultType.getElementType(), inputType.getEncoding());
                     result = builder.create<mlir::nova::ReduceOp>(
                         loc,
                         mlir::nova::ReductionKind::MAX,
                         operands[0],
-                        resultType,
+                        rowMaxType,
                         /*keepdims=*/true,
                         llvm::ArrayRef<int64_t>{1},
                         /*ignore_nan=*/false
                     ).getResult();
                 }
                 break;
+            }
 
-            case Op::MeanAll:
+            case Op::MeanAll: {
                 if (operands.size() == 1) {
-                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
                     result = builder.create<mlir::nova::ReduceOp>(
                         loc,
                         mlir::nova::ReductionKind::MEAN,
                         operands[0],
-                        scalarType,
+                        resultType,
                         /*keepdims=*/false,
                         llvm::ArrayRef<int64_t>{},
                         /*ignore_nan=*/false
                     ).getResult();
                 }
                 break;
+            }
 
-            case Op::MSELoss:
+            case Op::MSELoss: {
                 if (operands.size() == 2) {
-                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
                     result = builder.create<mlir::nova::MseOp>(
-                        loc, scalarType, operands[0], operands[1]
+                        loc, resultType, operands[0], operands[1]
                     ).getResult();
                 }
                 break;
+            }
 
-            case Op::MAELoss:
+            case Op::MAELoss: {
                 if (operands.size() == 2) {
-                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
+                    auto inputType = cast<mlir::RankedTensorType>(operands[0].getType());
                     result = builder.create<mlir::nova::MaeOp>(
-                        loc, scalarType, operands[0], operands[1]
+                        loc, resultType, operands[0], operands[1]
+                    ).getResult();
+                }
+                break;
+            }
+
+            case Op::SoftmaxRow:
+                if (operands.size() == 1) {
+                    result = builder.create<mlir::nova::SoftmaxOp>(
+                        loc, resultType, operands[0]
                     ).getResult();
                 }
                 break;
 
-            case Op::BinaryCrossEntropy:
+            case Op::BinaryCrossEntropy: {
                 if (operands.size() == 2) {
-                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
+                    auto inputType = cast<mlir::RankedTensorType>(operands[0].getType());
                     result = builder.create<mlir::nova::BceOp>(
-                        loc, scalarType, operands[0], operands[1]
+                        loc, resultType, operands[0], operands[1]
                     ).getResult();
                 }
                 break;
-
-            case Op::CategoricalCrossEntropy:
+            }
+            case Op::CategoricalCrossEntropy: {
                 if (operands.size() == 2) {
-                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
+                    auto inputType = cast<mlir::RankedTensorType>(operands[0].getType());
                     result = builder.create<mlir::nova::CceOp>(
-                        loc, scalarType, operands[0], operands[1]
+                        loc, resultType, operands[0], operands[1]
                     ).getResult();
                 }
                 break;
+            }
 
             case Op::CeWithLogits:
                 llvm::errs() << "Warning: CeWithLogits not yet supported in MLIR emitter\n";
@@ -417,14 +409,15 @@ MLIREmitter::emitModule(const Plan& plan) {
                 return {mlir::OwningOpRef<mlir::ModuleOp>(module), ""};
                 break;
 
-            case Op::SparseCeWithLogits:
+            case Op::SparseCeWithLogits: {
                 if (operands.size() == 2) {
-                    auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
+                    auto inputType = cast<mlir::RankedTensorType>(operands[0].getType());
                     result = builder.create<mlir::nova::SceOp>(
-                        loc, scalarType, operands[0], operands[1]
+                        loc, resultType, operands[0], operands[1]
                     ).getResult();
                 }
                 break;
+            }
 
             default:
                 llvm::errs() << "Warning: Unsupported op " << op_name(step.op) 
