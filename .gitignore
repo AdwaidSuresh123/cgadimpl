@@ -30,6 +30,7 @@ build/
 *.pdb
 *.class         
 build/
+Data/
 bin/
 CMakeCache.txt
 CMakeFiles/

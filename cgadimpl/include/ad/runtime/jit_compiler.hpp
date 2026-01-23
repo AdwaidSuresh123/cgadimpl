@@ -20,7 +20,7 @@ struct Compiled {
     // MLIR data
     std::string mlir_source;
     std::shared_ptr<void> mlir_module;
-
+    std::string mlir_module_str;
     void* compiled_func = nullptr;
     std::shared_ptr<void> aot_context;
     // Execute the compiled plan

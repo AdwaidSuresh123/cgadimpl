@@ -251,4 +251,21 @@ Tensor jvp(const Value& root, const std::unordered_map<Node*, Tensor>& seed){
     return T[root.node.get()];
 }
 
+void detach_graph(const Value& root) {
+    if (!root.node) return;
+    
+    auto order = topo_from(root.node.get());
+    
+    // Clear all non-leaf nodes to break shared_ptr cycles
+    for (Node* n : order) {
+        if (!n->is_leaf) {
+            n->inputs.clear();       // Break parent references
+            n->tape.clear();         // Clear saved tensors
+            n->saved_inputs.clear(); // Clear saved inputs
+            n->value = Tensor();     // Free activation memory
+            n->grad = Tensor();      // Free gradient memory
+        }
+    }
+}
+
 } // namespace ag

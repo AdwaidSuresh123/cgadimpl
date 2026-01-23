@@ -14,5 +14,6 @@ void backward (const Value& root, const Tensor* grad_seed=nullptr, bool enable_p
 
 Tensor jvp (const Value& root, const std::unordered_map<Node*, Tensor>& seed);
 
+void detach_graph(const Value& root);
 
 } // namespace ag

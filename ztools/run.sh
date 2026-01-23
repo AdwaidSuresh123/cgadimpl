@@ -24,6 +24,7 @@ export PATH="/usr/local/cuda/bin:$ROOT/Nova-Compiler/install/bin:$PATH"
 export CUDACXX=/usr/local/cuda/bin/nvcc
 # Add CUDA and Nova-Compiler binaries to PATH so they are found at runtime
 export PATH="/usr/local/cuda/bin:$ROOT/Nova-Compiler/install/bin:$PATH"
+export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/home/blu-bridge006/Desktop/llvm-project/build/lib"
 
 echo "== Build Type:    $BUILD_TYPE"
 echo "== Using CUDA CXX: $CUDACXX"

@@ -80,4 +80,40 @@ void Adam::zero_grad() {
     }
 }
 
+float clip_grad_norm_(std::vector<Value>& params, float max_norm) {
+    // Compute total gradient L2 norm across all parameters
+    float total_norm_sq = 0.0f;
+    
+    for (const auto& p : params) {
+        Node* n = p.node.get();
+        if (!n->requires_grad() || n->grad.numel() == 0) continue;
+        
+        // Move to CPU for norm computation
+        Tensor grad_cpu = n->grad;
+        if (grad_cpu.device().device != OwnTensor::Device::CPU) {
+            grad_cpu = grad_cpu.to_cpu();
+        }
+        
+        // Compute sum of squares
+        const float* g_ptr = grad_cpu.data<float>();
+        for (int64_t i = 0; i < grad_cpu.numel(); ++i) {
+            total_norm_sq += g_ptr[i] * g_ptr[i];
+        }
+    }
+    
+    float total_norm = std::sqrt(total_norm_sq);
+    
+    // Clip gradients if norm exceeds max_norm
+    if (total_norm > max_norm) {
+        float clip_coef = max_norm / (total_norm + 1e-6f);
+        for (const auto& p : params) {
+            Node* n = p.node.get();
+            if (!n->requires_grad() || n->grad.numel() == 0) continue;
+            n->grad *= clip_coef;
+        }
+    }
+    
+    return total_norm;
+}
+
 } // namespace ag
