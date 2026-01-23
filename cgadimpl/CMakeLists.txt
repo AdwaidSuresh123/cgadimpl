@@ -214,8 +214,7 @@ if(true)
   add_ag_test(test_jit_edge_cases                             Tests/test_jit_edge_cases.cpp)
   add_ag_test(test_jit_basic                                  Tests/test_jit_basic.cpp)
   add_ag_test(test_jit_stress                                 Tests/test_jit_stress.cpp)
-  add_ag_test(test_jit_benchmark                               Tests/test_jit_benchmark.cpp)
- 
+  add_ag_test(test_jit_benchmark                               Tests/test_jit_benchmark.cpp) 
   # Ops Tests
 #   add_ag_test(test_activation                  Tests/ops_test/test_activation.cpp)
 #   add_ag_test(test_arithmetic                  Tests/ops_test/test_arithmetic.cpp)

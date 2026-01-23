@@ -1,102 +1,77 @@
 #include "ad/ag_all.hpp"
 #include <iostream>
 #include <vector>
-#include <iomanip>
-#include <cuda_runtime.h>
 #include "ad/runtime/jit_compiler.hpp"
 
 using namespace ag;
 
 int main() {
-    std::cout << "===== JIT COMPILER TEST WITH GPU METRICS =====\n";
-
-    // ---------- GPU Hardware Info ----------
-    int deviceCount = 0;
-    cudaGetDeviceCount(&deviceCount);
-    if (deviceCount > 0) {
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, 0);
-        std::cout << "GPU Device: " << prop.name << "\n";
-        std::cout << "Compute Capability: " << prop.major << "." << prop.minor << "\n";
-        std::cout << "Total Global Memory: " << prop.totalGlobalMem / (1024 * 1024) << " MB\n";
-        std::cout << "-------------------------------------------\n";
-    }
+    std::cout << "===== JIT COMPILER TEST =====\n";
 
     // ---------- Shapes & Data ----------
     const int B = 8;   // batch size
     const int In = 16; // input dim
     const int Out = 10; // output dim
 
+    // Use default options (CPU, requires_grad=false)
     auto opts_const = TensorOptions().with_device(Device::CUDA);
     Tensor Xt = Tensor::randn<float>(Shape{{B, In}}, opts_const);
     Value X = make_tensor(Xt, "X");
 
+    // ---------- Parameters ----------
+    // Parameters must have requires_grad=true
     auto opts_param = TensorOptions().with_req_grad(true).with_device(Device::CUDA);
     auto W1 = make_tensor(Tensor::randn<float>(Shape{{In, Out}}, opts_param), "W1");
     auto b1 = make_tensor(Tensor::zeros(Shape{{1, Out}}, opts_param), "b1");
     
+    // Target for MSE Loss
     auto opts_target = TensorOptions().with_req_grad(false).with_device(Device::CUDA);
     auto target = make_tensor(Tensor::randn<float>(Shape{{B, Out}}, opts_target), "target");
 
-    // ---------- Forward Pass ----------
+    // ---------- Forward Pass (using only JIT-supported ops) ----------
+    // A simple linear layer: Z = X @ W1 + b1
     Value Z = matmul(X, W1) + b1;
+
+    // MSE Loss
     Value loss = mse_loss(Z, target);
     
     std::cout << "Eager forward pass completed.\n";
     
+    // ---------- Eager Backward ----------
     ag::backward(loss);
     float eager_loss = loss.val().to_cpu().data<float>()[0];
-    std::cout << "Eager Loss: " << std::fixed << std::setprecision(6) << eager_loss << "\n";
+    std::cout << "Eager Loss: " << eager_loss << "\n";
 
     // ---------- JIT Compilation ----------
     std::cout << "\nCompiling graph...\n";
+
+    // Tell the compiler which leaves are runtime inputs vs. trainable parameters
     std::vector<Value> inputs = {X, target};
     std::vector<Value> params = {W1, b1};
 
+    // The 'loss' Value is the root of the graph to be compiled
     ag::jit::CompileOptions opts;
     opts.include_backward = true;
     auto comp = ag::jit::compile(loss, inputs, params, opts);
 
     std::cout << "Graph compilation successful.\n";
 
-    // ---------- JIT Execution with Timing ----------
+    // ---------- JIT Execution ----------
     std::cout << "\nRunning compiled graph...\n";
 
+    // Prepare raw tensor pointers for the run() method
     std::vector<Tensor*> in_ptrs = {&X.node->value, &target.node->value};
     std::vector<Tensor*> par_ptrs = {&W1.node->value, &b1.node->value};
 
-    // CUDA Timing Setup
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
     std::vector<Tensor> jit_outputs;
-    
-    cudaEventRecord(start);
     bool ok = comp.run(in_ptrs, par_ptrs, jit_outputs);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-
+    
     if (!ok) {
-        std::cerr << "FAIL: JIT execution failed.\n";
+        std::cerr << "FAIL: JIT execution failed (shape guard or other error).\n";
         return 1;
     }
 
     std::cout << "Compiled execution successful.\n";
-    std::cout << "JIT Execution Time: " << std::fixed << std::setprecision(4) << milliseconds << " ms\n";
-    
-    // Calculate GFLOPS (Very approximate for this small graph)
-    // Matmul 1: 8x16 @ 16x10 = 2 * 8 * 16 * 10 = 2560 ops
-    // Add bias: 8 * 10 = 80 ops
-    // MSE Loss: ~ 3 * 8 * 10 = 240 ops
-    // Backward matmul: 16x8 @ 8x10 = 2 * 16 * 8 * 10 = 2560 ops
-    // Total approx: 5500 ops
-    double total_ops = 5500.0;
-    double gflops = (total_ops / (milliseconds / 1000.0)) / 1e9;
-    std::cout << "JIT Throughput (Approx): " << gflops << " GFLOPS\n";
     
     // ---------- Verification ----------
     float compiled_loss = jit_outputs[0].to_cpu().data<float>()[0];
@@ -111,23 +86,36 @@ int main() {
         std::cout << "❌ FAIL: Loss mismatch.\n";
     }
     
+    // Verify Gradients
+    // jit_outputs[1] -> grad W1
+    // jit_outputs[2] -> grad b1
     bool grads_match = true;
     
     // W1 grad
     {
         Tensor eager_grad = W1.grad().to_cpu();
         Tensor jit_grad = jit_outputs[1].to_cpu();
+        float eager_mean = OwnTensor::reduce_mean(OwnTensor::abs(eager_grad, ag::current_stream())).data<float>()[0];
+        float jit_mean = OwnTensor::reduce_mean(OwnTensor::abs(jit_grad, ag::current_stream())).data<float>()[0];
         float mad = OwnTensor::reduce_mean(OwnTensor::abs(eager_grad - jit_grad, ag::current_stream())).data<float>()[0];
-        std::cout << "W1 Grad MAD: " << std::scientific << mad << "\n";
+        
+        std::cout << "W1 Grad Eager Mean: " << eager_mean << "\n";
+        std::cout << "W1 Grad JIT Mean:   " << jit_mean << "\n";
+        std::cout << "W1 Grad MAD: " << mad << "\n";
         if (mad > 1e-4f) grads_match = false;
     }
     
     // b1 grad
     {
         Tensor eager_grad = b1.grad().to_cpu();
-        Tensor jit_grad = jit_outputs[2].to_cpu();
+        Tensor jit_grad = jit_outputs[2].contiguous().to_cpu();
+        float eager_mean = OwnTensor::reduce_mean(OwnTensor::abs(eager_grad, ag::current_stream())).data<float>()[0];
+        float jit_mean = OwnTensor::reduce_mean(OwnTensor::abs(jit_grad, ag::current_stream())).data<float>()[0];
         float mad = OwnTensor::reduce_mean(OwnTensor::abs(eager_grad - jit_grad, ag::current_stream())).data<float>()[0];
-        std::cout << "b1 Grad MAD: " << std::scientific << mad << "\n";
+        
+        std::cout << "b1 Grad Eager Mean: " << eager_mean << "\n";
+        std::cout << "b1 Grad JIT Mean:   " << jit_mean << "\n";
+        std::cout << "b1 Grad MAD: " << mad << "\n";
         if (mad > 1e-4f) grads_match = false;
     }
     
@@ -136,9 +124,6 @@ int main() {
     } else {
         std::cout << "FAIL: Gradient mismatch.\n";
     }
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
 
     return 0;
 }

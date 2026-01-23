@@ -10,7 +10,6 @@
 #include <cassert>
 #include <sstream>
 #include "ad/ops/ops.hpp"
-#include "tensor.hpp"
 #include "mlp/activation.h"
 #include "mlp/loss.h"
 #include <fstream>
@@ -20,11 +19,18 @@
 
 namespace ag::jit {
 
+struct ResultMetadata {
+    std::vector<int64_t> shape;
+    OwnTensor::Dtype dtype;
+    OwnTensor::DeviceIndex device;
+};
+
 struct AOTContext {
     void* ciface_func = nullptr;
     void* dl_handle = nullptr;
     Plan plan;
     std::string mlir_source;  // Optimized/lowered MLIR (LLVM dialect)
+    std::vector<ResultMetadata> result_meta;
 
     ~AOTContext() {
         if (dl_handle) {
@@ -767,10 +773,6 @@ ag::jit::Compiled compile(const ag::Value& output,
             auto compileResult = compiler.compileString(c.mlir_source, "", options);
             if (compileResult.success) {
                 c.mlir_source = compileResult.output;
-                // std::cout << "=== Optimized MLIR Generated via NovaCompilerAPI ===\n"<<c.mlir_source<<std::endl;
-                std::ofstream ofs("optimized.mlir");
-                ofs << c.mlir_source;
-                ofs.close();
             }
         } catch (const std::exception& e) {
             std::cerr << "Warning: Optimization pipeline failed: " << e.what() << "\n";
@@ -858,38 +860,13 @@ extern "C" void* ABIAdapter(void** args, void* context_ptr) {
         input_descriptors.push_back(buildMemRefDescriptor(t, plan.sig.param_meta[i]));
     }
     
-    // Determine result metadata from plan
-    std::vector<std::vector<int64_t>> result_shapes;
-    std::vector<OwnTensor::Dtype> result_dtypes;
-    std::vector<OwnTensor::DeviceIndex> result_devices;
-    
-    size_t num_results = plan.out_slots.size();
-    
-    for (int slot : plan.out_slots) {
-        bool found = false;
-        for (const auto& step : plan.steps) {
-            if (step.out_slot == slot) {
-                result_shapes.push_back(step.out_meta.shape);
-                result_dtypes.push_back(step.out_meta.dtype);
-                
-                result_devices.push_back(step.out_meta.device);
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            result_shapes.push_back({});
-            result_dtypes.push_back(OwnTensor::Dtype::Float32);
-            result_devices.push_back(OwnTensor::DeviceIndex(OwnTensor::Device::CPU));
-        }
-    }
-    
+    size_t num_results = context->result_meta.size();
     std::vector<size_t> result_desc_offsets;
     size_t packed_struct_size = 0;
     for (size_t r = 0; r < num_results; ++r) {
         packed_struct_size = alignTo(packed_struct_size, 8);
         result_desc_offsets.push_back(packed_struct_size);
-        packed_struct_size += sizeof(void*) * 2 + sizeof(int64_t) * (1 + 2 * result_shapes[r].size());
+        packed_struct_size += sizeof(void*) * 2 + sizeof(int64_t) * (1 + 2 * context->result_meta[r].shape.size());
     }
     packed_struct_size = alignTo(packed_struct_size, 64);
 
@@ -903,7 +880,7 @@ extern "C" void* ABIAdapter(void** args, void* context_ptr) {
     auto cleanup = [&]() {
         for (size_t i = 0; i < num_results; ++i) {
             if (result_buffers[i]) {
-                if (result_devices[i].device == OwnTensor::Device::CUDA) cudaFree(result_buffers[i]);
+                if (context->result_meta[i].device.device == OwnTensor::Device::CUDA) cudaFree(result_buffers[i]);
                 else std::free(result_buffers[i]);
             }
         }
@@ -911,18 +888,19 @@ extern "C" void* ABIAdapter(void** args, void* context_ptr) {
     };
 
     for (size_t r = 0; r < num_results; ++r) {
-        size_t elem_size = getElementSize(result_dtypes[r]);
+        auto& meta = context->result_meta[r];
+        size_t elem_size = getElementSize(meta.dtype);
         size_t total_elements = 1;
-        for (auto dim : result_shapes[r]) total_elements *= dim;
+        for (auto dim : meta.shape) total_elements *= dim;
         size_t buffer_size = std::max((size_t)1, total_elements) * elem_size;
         
-        if (result_devices[r].device == OwnTensor::Device::CUDA) {
+        if (meta.device.device == OwnTensor::Device::CUDA) {
             if (cudaMalloc(&result_buffers[r], buffer_size) != cudaSuccess) { cleanup(); return nullptr; }
         } else {
             result_buffers[r] = std::malloc(buffer_size);
         }
         if (!result_buffers[r]) { cleanup(); return nullptr; }
-        if (result_devices[r].device != OwnTensor::Device::CUDA) {
+        if (meta.device.device != OwnTensor::Device::CUDA) {
             std::memset(result_buffers[r], 0, buffer_size);
         } else {
             cudaMemset(result_buffers[r], 0, buffer_size);
@@ -933,19 +911,18 @@ extern "C" void* ABIAdapter(void** args, void* context_ptr) {
         *reinterpret_cast<void**>(desc_ptr + sizeof(void*)) = result_buffers[r];
         *reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2) = 0; // Offset = 0
         
-        if (!result_shapes[r].empty()) {
+        if (!meta.shape.empty()) {
             int64_t* sizes_ptr = reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2 + sizeof(int64_t));
-            int64_t* strides_ptr = sizes_ptr + result_shapes[r].size();
-            for (size_t i = 0; i < result_shapes[r].size(); ++i) sizes_ptr[i] = result_shapes[r][i];
+            int64_t* strides_ptr = sizes_ptr + meta.shape.size();
+            for (size_t i = 0; i < meta.shape.size(); ++i) sizes_ptr[i] = meta.shape[i];
             int64_t stride = 1;
-            for (int i = (int)result_shapes[r].size() - 1; i >= 0; --i) { 
+            for (int i = (int)meta.shape.size() - 1; i >= 0; --i) { 
                 strides_ptr[i] = stride; 
-                stride *= result_shapes[r][i]; 
+                stride *= meta.shape[i]; 
             }
         }
     }
     
-
     std::vector<void*> desc_ptrs;
     for (auto& desc : input_descriptors) {
         desc_ptrs.push_back(desc.data());
@@ -958,21 +935,16 @@ extern "C" void* ABIAdapter(void** args, void* context_ptr) {
     
     // Check if we are running on GPU
     bool is_gpu = false;
-    for (size_t i = 0; i < num_results; ++i) if (result_devices[i].device == OwnTensor::Device::CUDA) is_gpu = true;
+    for (size_t i = 0; i < num_results; ++i) if (context->result_meta[i].device.device == OwnTensor::Device::CUDA) is_gpu = true;
     if (is_gpu) {
         std::cout << "[JIT Runtime] Launching GPU kernel(s)..." << std::endl;
     }
 
     reinterpret_cast<CIfaceFunc>(context->ciface_func)(packed_output_raw, desc_ptrs.data());
-    
-    for (size_t r = 0; r < num_results; ++r) {
-        char* desc_ptr = static_cast<char*>(packed_output_raw) + result_desc_offsets[r];
-        void* allocated = *reinterpret_cast<void**>(desc_ptr);
-        void* aligned = *reinterpret_cast<void**>(desc_ptr + sizeof(void*));
-    }
 
     auto* output_tensors = new std::vector<Tensor>();
     for (size_t r = 0; r < num_results; ++r) {
+        auto& meta = context->result_meta[r];
         char* desc_ptr = static_cast<char*>(packed_output_raw) + result_desc_offsets[r];
         void* allocated = *reinterpret_cast<void**>(desc_ptr);
         void* aligned = *reinterpret_cast<void**>(desc_ptr + sizeof(void*));
@@ -982,13 +954,13 @@ extern "C" void* ABIAdapter(void** args, void* context_ptr) {
             continue;
         }
 
-        size_t rank = result_shapes[r].size();
+        size_t rank = meta.shape.size();
         int64_t* sizes_ptr = reinterpret_cast<int64_t*>(desc_ptr + sizeof(void*) * 2 + sizeof(int64_t));
         int64_t* strides_ptr = sizes_ptr + rank;
         
-        Tensor out(OwnTensor::Shape{result_shapes[r].empty() ? std::vector<int64_t>{1} : result_shapes[r]}, result_dtypes[r], result_devices[r], false);
-        size_t total_elements = 1; for (auto dim : result_shapes[r]) total_elements *= dim;
-        size_t elem_size = getElementSize(result_dtypes[r]);
+        Tensor out(OwnTensor::Shape{meta.shape.empty() ? std::vector<int64_t>{1} : meta.shape}, meta.dtype, meta.device, false);
+        size_t total_elements = 1; for (auto dim : meta.shape) total_elements *= dim;
+        size_t elem_size = getElementSize(meta.dtype);
         
         bool is_contiguous = true;
         int64_t expected_stride = 1;
@@ -1004,7 +976,7 @@ extern "C" void* ABIAdapter(void** args, void* context_ptr) {
                 int64_t s0 = strides_ptr[0];
                 char* src_base = static_cast<char*>(aligned) + (offset * elem_size);
                 char* dst_base = static_cast<char*>(out.data());
-                for (int64_t i = 0; i < result_shapes[r][0]; ++i) {
+                for (int64_t i = 0; i < meta.shape[0]; ++i) {
                     cudaMemcpy(dst_base + i * elem_size, src_base + i * s0 * elem_size, elem_size, cudaMemcpyDefault);
                 }
             } else if (rank == 2) {
@@ -1012,9 +984,9 @@ extern "C" void* ABIAdapter(void** args, void* context_ptr) {
                 int64_t s1 = strides_ptr[1];
                 char* src_base = static_cast<char*>(aligned) + (offset * elem_size);
                 char* dst_base = static_cast<char*>(out.data());
-                for (int64_t i = 0; i < result_shapes[r][0]; ++i) {
-                    for (int64_t j = 0; j < result_shapes[r][1]; ++j) {
-                        cudaMemcpy(dst_base + (i * result_shapes[r][1] + j) * elem_size, 
+                for (int64_t i = 0; i < meta.shape[0]; ++i) {
+                    for (int64_t j = 0; j < meta.shape[1]; ++j) {
+                        cudaMemcpy(dst_base + (i * meta.shape[1] + j) * elem_size, 
                                     src_base + (i * s0 + j * s1) * elem_size, elem_size, cudaMemcpyDefault);
                     }
                 }
@@ -1025,10 +997,7 @@ extern "C" void* ABIAdapter(void** args, void* context_ptr) {
         
         output_tensors->push_back(std::move(out));
         
-        // IMPORTANT: The JIT code allocated this memory via cudaMalloc (for GPU) or malloc (for CPU)
-        // We must free it after copying to our Tensor
         if (allocated) {
-            // Robustly determine if the pointer is Device or Host memory to use correct free()
             cudaPointerAttributes free_attrs;
             cudaError_t free_err = cudaPointerGetAttributes(&free_attrs, allocated);
             bool is_device = (free_err == cudaSuccess && free_attrs.type == cudaMemoryTypeDevice);
@@ -1037,7 +1006,6 @@ extern "C" void* ABIAdapter(void** args, void* context_ptr) {
             if (is_device) {
                 cudaFree(allocated);
             } else {
-                // If it's host but we are here, it might be from malloc in JIT CPU code
                 std::free(allocated);
             }
 
@@ -1102,7 +1070,8 @@ void* compileAndLoad(const std::string& mlir_source, void** out_dl_handle, const
     
     std::string link_flags;
     if (device == "gpu") {
-        std::string llvm_lib_dir = "/home/blu-bridge023/Desktop/llvm-project/build/lib";
+        const char* llvm_env = std::getenv("LLVM_DIR");
+        std::string llvm_lib_dir = llvm_env ? std::string(llvm_env) + "/lib" : "/home/blu-bridge023/Desktop/llvm-project/build/lib";
         link_flags = " -L" + llvm_lib_dir + " -lmlir_cuda_runtime -lmlir_runner_utils -lmlir_c_runner_utils" +
                      " -L/usr/local/cuda/lib64 -lcudart" +
                      " -Wl,-rpath," + llvm_lib_dir +
@@ -1124,23 +1093,20 @@ void* compileAndLoad(const std::string& mlir_source, void** out_dl_handle, const
     std::remove(mlir_file.c_str());
     std::remove(ll_file.c_str());
     std::remove(obj_file.c_str());
-    // Note: so_file must remain for dlopen() to work, but it will be orphaned and deleted by OS or on process exit if we unlink now
     std::remove(so_file.c_str()); 
 
     if (!handle) {
+        std::cerr << "Error: dlopen failed: " << dlerror() << "\n";
         return nullptr;
     }
     
     if (out_dl_handle) *out_dl_handle = handle;
     
-    void* func_ptr = dlsym(handle, "_mlir_ciface_main");
-    if (!func_ptr) {
-        func_ptr = dlsym(handle, "main");
-    }
-    
-    // Also try without prepended underscore for some environments
-    if (!func_ptr) {
-        func_ptr = dlsym(handle, "mlir_ciface_main");
+    // Search for entry point symbol (mangled or unmangled)
+    const char* symbols[] = {"_mlir_ciface_main", "mlir_ciface_main", "main"};
+    void* func_ptr = nullptr;
+    for (const char* sym : symbols) {
+        if ((func_ptr = dlsym(handle, sym))) break;
     }
 
     if (!func_ptr) {
@@ -1159,6 +1125,22 @@ void storeAOTContext(void* func_ptr, void* dl_handle, const Plan& plan, const st
     ctx->dl_handle = dl_handle;
     ctx->plan = plan;
     ctx->mlir_source = mlir_source;
+
+    // Cache result metadata to avoid re-calculating on every run
+    for (int slot : plan.out_slots) {
+        bool found = false;
+        for (const auto& step : plan.steps) {
+            if (step.out_slot == slot) {
+                ctx->result_meta.push_back({step.out_meta.shape, step.out_meta.dtype, step.out_meta.device});
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            ctx->result_meta.push_back({{}, OwnTensor::Dtype::Float32, OwnTensor::DeviceIndex(OwnTensor::Device::CPU)});
+        }
+    }
+
     out_context = std::shared_ptr<AOTContext>(ctx); 
 }
 
