@@ -35,6 +35,15 @@ inline std::shared_ptr<Node> operator-(const std::shared_ptr<Node>& a, const std
 inline std::shared_ptr<Node> operator*(const std::shared_ptr<Node>& a, const std::shared_ptr<Node>& b){ return mul_nodeops(a,b);}
 inline std::shared_ptr<Node> operator/(const std::shared_ptr<Node>& a, const std::shared_ptr<Node>& b){ return div_nodeops(a,b);}
 
+// Activations ------------------
+std::shared_ptr<Node> relu_nodeops(const std::shared_ptr<Node>& x);
+std::shared_ptr<Node> sigmoid_nodeops(const std::shared_ptr<Node>& x);
+std::shared_ptr<Node> tanh_nodeops(const std::shared_ptr<Node>& x);
+std::shared_ptr<Node> softplus_nodeops(const std::shared_ptr<Node>& x);
+std::shared_ptr<Node> gelu_nodeops(const std::shared_ptr<Node>& x);
+std::shared_ptr<Node> silu_nodeops(const std::shared_ptr<Node>& x);
+std::shared_ptr<Node> mish_nodeops(const std::shared_ptr<Node>& x);
+
 // Unary Mathematical Functions -----------
 std::shared_ptr<Node> exp_nodeops(const std::shared_ptr<Node>& x);
 std::shared_ptr<Node> log_nodeops(const std::shared_ptr<Node>& x);
@@ -54,18 +63,6 @@ std::shared_ptr<Node> linear_nodeops(const  std::shared_ptr<Node>& a, const std:
 std::shared_ptr<Node> fmab_nodeops(const  std::shared_ptr<Node>& a, const std::shared_ptr<Node>& b, const std::shared_ptr<Node>& c); // fused multiply-add a@b + c
 std::shared_ptr<Node> dropout_nodeops(const std::shared_ptr<Node>& a, const std::shared_ptr<Node>& b);
 std::shared_ptr<Node> flatten_nodeops(const std::shared_ptr<Node>& a);
-
-// activations ----------------------------
-std::shared_ptr<Node> relu_nodeops(const std::shared_ptr<Node>& x);
-std::shared_ptr<Node> tanh_nodeops(const std::shared_ptr<Node>& x);
-std::shared_ptr<Node> sigmoid_nodeops(const std::shared_ptr<Node>& x);
-std::shared_ptr<Node> softplus_nodeops(const std::shared_ptr<Node>& x);
-
-// Modern Smooth Activations (better gradient flow) ---------
-std::shared_ptr<Node> gelu_nodeops(const std::shared_ptr<Node>& x); // tanh approx
-std::shared_ptr<Node> silu_nodeops(const std::shared_ptr<Node>& x); // x * sigmoid(x)
-std::shared_ptr<Node> mish_nodeops(const std::shared_ptr<Node>& x);
-
 // Parametric Activations ---
 std::shared_ptr<Node> leaky_relu_nodeops(const std::shared_ptr<Node>& x, float alpha=0.01f); // alpha via const input
 
@@ -136,6 +133,10 @@ std::shared_ptr<Node> atan_nodeops(const std::shared_ptr<Node>& x);
 std::shared_ptr<Node> asinh_nodeops(const std::shared_ptr<Node>& x);
 std::shared_ptr<Node> acosh_nodeops(const std::shared_ptr<Node>& x);
 std::shared_ptr<Node> atanh_nodeops(const std::shared_ptr<Node>& x);
+
+// Indexing Operations ----------------
+std::shared_ptr<Node> gather_nodeops(const std::shared_ptr<Node>& input, const std::shared_ptr<Node>& dim, const std::shared_ptr<Node>& index);
+std::shared_ptr<Node> scatter_add_nodeops(const std::shared_ptr<Node>& self, const std::shared_ptr<Node>& dim, const std::shared_ptr<Node>& index, const std::shared_ptr<Node>& src);
 
 } // namespace detail
 } // namespace ag

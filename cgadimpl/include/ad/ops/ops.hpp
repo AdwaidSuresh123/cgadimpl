@@ -44,9 +44,13 @@ Value lisht(const Value& x);
 
 // Standard Attention ---------
 Value attention(const Value& a, const Value& b, const Value& c, const Value& d);
+//Value gather(const Value& x, float a, float b);
 
 // Gated activation -----------------
 Value swiglu(const Value& x, const Value& a, const Value& b, const Value& c, const Value& d);
+
+Value gather(const Value& input, const Value& dim, const Value& index);
+Value scatter_add(const Value& self, const Value& dim, const Value& index, const Value& src);
 
 //Leaf --------------------
 //leaf

@@ -1,0 +1,7 @@
+// =============================================================================
+// FILE: ops/indexing.def
+// PURPOSE: Indexing and slicing operations
+// =============================================================================
+
+OP(Gather,     3,    "gather")      // gather(input, dim, index)
+OP(ScatterAdd, 4,    "scatter_add") // scatter_add(self, dim, index, src)

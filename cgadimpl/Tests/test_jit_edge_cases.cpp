@@ -60,10 +60,10 @@ void test_large_scale_mlp() {
     const int H2 = 512;
     const int Out = 10;
 
-    Value X = make_tensor(Tensor::randn<float>(Shape{{B, In}}, TensorOptions()), "X");
-    Value Y = make_tensor(Tensor::randn<float>(Shape{{B, Out}}, TensorOptions()), "Y");
+    Value X = make_tensor(Tensor::randn<float>(Shape{{B, In}}, TensorOptions().with_device(Device::CUDA)), "X");
+    Value Y = make_tensor(Tensor::randn<float>(Shape{{B, Out}}, TensorOptions().with_device(Device::CUDA)), "Y");
 
-    auto opts = TensorOptions().with_req_grad(true);
+    auto opts = TensorOptions().with_req_grad(true).with_device(Device::CUDA);
     auto W1 = make_tensor(Tensor::randn<float>(Shape{{In, H1}}, opts) * 0.01f, "W1");
     auto b1 = make_tensor(Tensor::zeros(Shape{{1, H1}}, opts), "b1");
     auto W2 = make_tensor(Tensor::randn<float>(Shape{{H1, H2}}, opts) * 0.01f, "W2");

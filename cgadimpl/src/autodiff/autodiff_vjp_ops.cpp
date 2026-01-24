@@ -592,6 +592,35 @@ void vjp_ATanh(Node* n, const Tensor& gy){
     if (X->requires_grad()) X->accumulate_grad(gy / (1.0f - X->value * X->value));
 }
 
+void vjp_Gather(Node* n, const Tensor& gy) {
+    Node* input = n->inputs[0].get();
+    Node* dim_node = n->inputs[1].get();
+    Node* index_node = n->inputs[2].get();
+    
+    if (input->requires_grad()) {
+        int dim = static_cast<int>(dim_node->value.to_cpu().data<float>()[0]);
+        Tensor dx = OwnTensor::Tensor::zeros(input->value.shape(), ag::options(input->value));
+        OwnTensor::scatter_add(dx, dim, index_node->value, gy);
+        input->accumulate_grad(dx);
+    }
+}
+
+void vjp_ScatterAdd(Node* n, const Tensor& gy) {
+    Node* self = n->inputs[0].get();
+    Node* dim_node = n->inputs[1].get();
+    Node* index_node = n->inputs[2].get();
+    Node* src = n->inputs[3].get();
+    
+    if (self->requires_grad()) {
+        self->accumulate_grad(gy);
+    }
+    
+    if (src->requires_grad()) {
+        int dim = static_cast<int>(dim_node->value.to_cpu().data<float>()[0]);
+        Tensor dsrc = OwnTensor::gather(gy, dim, index_node->value);
+        src->accumulate_grad(dsrc);
+    }
+}
 
 } // namespace detail
 

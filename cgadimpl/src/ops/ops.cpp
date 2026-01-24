@@ -4,12 +4,12 @@
 #include "ad/ops/ops.hpp"
 #include "ad/ops/nodeops.hpp" // Include the new node-level declarations
 #include "ad/autodiff/inplace.hpp"
-#include "ad/ops/nodeops.hpp"
 #include <cuda_runtime.h>
 #include "tensor.hpp" 
 #include <unordered_map>
 #include <cmath> 
 #include <type_traits> 
+#include <ad/autodiff/checkpoint.hpp>
 
 namespace ag {
 
@@ -199,22 +199,13 @@ namespace ag {
         return Value(ag::detail::atanh_nodeops(x.node));
     }
 
-    
+    Value gather(const Value& input, const Value& dim, const Value& index){
+        return Value(ag::detail::gather_nodeops(input.node, dim.node, index.node));
+    }
 
-
-
-
-
-
-
-    
-
-
-    
-
-
-
-
+    Value scatter_add(const Value& self, const Value& dim, const Value& index, const Value& src){
+        return Value(ag::detail::scatter_add_nodeops(self.node, dim.node, index.node, src.node));
+    }
 
 //  The implementation of **forward evaluation logic** for a single
 // computational graph node (`Node`) in the autodiff system.
@@ -267,7 +258,6 @@ namespace ag {
  *      5️⃣  Return the computed output tensor.
  *      6️⃣  If unsupported, throw a runtime error.
  */
-#include <ad/autodiff/checkpoint.hpp>
 Tensor forward_eval_node(const std::shared_ptr<Node> &node) {
     if (!node) throw std::runtime_error("forward_eval_node: null node");
 
@@ -322,7 +312,20 @@ Tensor forward_eval_node(const std::shared_ptr<Node> &node) {
             const Tensor &X = node->inputs[0]->value;
             return log(X);
         }
-        
+        case Op::Gather: {
+            const Tensor &input = node->inputs[0]->value;
+            int dim = static_cast<int>(node->inputs[1]->value.to_cpu().data<float>()[0]);
+            const Tensor &index = node->inputs[2]->value;
+            return OwnTensor::gather(input, dim, index);
+        }
+        case Op::ScatterAdd: {
+            Tensor self = node->inputs[0]->value.clone();
+            int dim = static_cast<int>(node->inputs[1]->value.to_cpu().data<float>()[0]);
+            const Tensor &index = node->inputs[2]->value;
+            const Tensor &src = node->inputs[3]->value;
+            OwnTensor::scatter_add(self, dim, index, src);
+            return self;
+        }
 
         // ============================================================
         // Leaf node (constants or inputs)
