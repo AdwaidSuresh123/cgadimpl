@@ -132,7 +132,44 @@ Compiled compile(const Value& output,
                 st.args.push_back(ArgSlot{ slot_of.at(p) });
             }
         }
-        plan.steps.push_back(std::move(st));
+        
+        // Decompose Linear(x, w, b) -> Add(MatMul(x, Transpose(w)), b)
+        if (n->op == Op::Linear) {
+            // 1. Transpose Weight (Input 1)
+            Step t_step;
+            t_step.op = Op::Transpose;
+            t_step.args.push_back(st.args[1]); // w
+            auto w_shape = n->inputs[1]->shape();
+            std::vector<int64_t> w_t_shape = {w_shape[1], w_shape[0]};
+            t_step.out_meta = ag::jit::TensorMetadata(w_t_shape, n->inputs[1]->value.dtype(), n->inputs[1]->value.device());
+            t_step.out_slot = plan.num_slots++;
+            plan.steps.push_back(t_step);
+            
+            // 2. MatMul(x, w.t)
+            Step mm_step;
+            mm_step.op = Op::MatMul;
+            mm_step.args.push_back(st.args[0]); // x
+            mm_step.args.push_back(ArgSlot{t_step.out_slot});
+            
+            // Output shape of matmul is same as linear output (since bias broadcast doesn't change shape usually, or it's [B, out])
+            mm_step.out_meta = st.out_meta;
+            mm_step.out_slot = plan.num_slots++;
+            plan.steps.push_back(mm_step);
+            
+            // 3. Add(mm, b)
+            Step add_step;
+            add_step.op = Op::Add;
+            add_step.args.push_back(ArgSlot{mm_step.out_slot});
+            add_step.args.push_back(st.args[2]); // b
+            add_step.out_meta = st.out_meta;
+            add_step.out_slot = plan.num_slots++;
+            plan.steps.push_back(add_step);
+            
+            // Map the Linear node to the final Add result
+            slot_of[n] = add_step.out_slot;
+        } else {
+            plan.steps.push_back(std::move(st));
+        }
     }
     plan.out_slots.push_back(slot_of.at(output.node.get()));
 
@@ -208,9 +245,12 @@ Compiled compile(const Value& output,
                             current_grad_slot = st.out_slot;
                         }
 
-                        // Handle broadcasting: if input shape is {1, C} and output is {B, C}, sum over dim 0
-                        if (input->shape().size() == 2 && n->shape().size() == 2 && 
-                            input->shape()[0] == 1 && n->shape()[0] > 1) {
+
+                        // Handle broadcasting: if input shape is {1, C} or {C} and output is {B, C}, sum over dim 0
+                        bool is_rank1_broadcast = (input->shape().size() == 1 && n->shape().size() == 2 && n->shape()[0] > 1);
+                        bool is_rank2_broadcast = (input->shape().size() == 2 && n->shape().size() == 2 && input->shape()[0] == 1 && n->shape()[0] > 1);
+                        
+                        if (is_rank1_broadcast || is_rank2_broadcast) {
                             
                             // 1. Transpose dz: {B, C} -> {C, B}
                             Step t1;
@@ -707,10 +747,267 @@ Compiled compile(const Value& output,
                     t_step.out_slot = plan.num_slots++;
                     plan.steps.push_back(t_step);
                     
-                    accumulate_grad(input, t_step.out_slot);
+                }
+            } else if (n->op == Op::Linear) {
+                // z = linear(x, w, b) = x @ w.T + b
+                // Inputs: 0=x, 1=w, 2=b
+                Node* x = n->inputs[0].get();
+                Node* w = n->inputs[1].get();
+                Node* b = n->inputs[2].get();
+                
+                // dx = dz @ w
+                if (x->requires_grad()) {
+                    Step mm;
+                    mm.op = Op::MatMul;
+                    mm.args.push_back(ArgSlot{grad_slot});
+                    
+                    // w is [out, in]. We need [out, in] as is? 
+                    // x is [B, in]. z is [B, out].
+                    // dx is [B, in].
+                    // dx = dz @ w.
+                    // [B, out] @ [out, in] -> [B, in]. Correct.
+                    
+                    if (slot_of.count(w)) mm.args.push_back(ArgSlot{slot_of[w]});
+                    else if (is_in(in_ix, w)) mm.args.push_back(ArgInput{in_ix[w]});
+                    else if (is_in(par_ix, w)) mm.args.push_back(ArgParam{par_ix[w]});
+                    else mm.args.push_back(ArgLit{w->value});
+                    
+                    mm.out_meta = ag::jit::TensorMetadata(x->shape(), x->value.dtype(), x->value.device());
+                    mm.out_slot = plan.num_slots++;
+                    plan.steps.push_back(mm);
+                    accumulate_grad(x, mm.out_slot);
+                }
+                
+                // dw = dz.T @ x
+                if (w->requires_grad()) {
+                    // w is [out, in]. dw is [out, in].
+                    // dz is [B, out]. x is [B, in].
+                    // dw = dz.T @ x -> [out, B] @ [B, in] -> [out, in]. Correct.
+                    
+                    Step t_dz;
+                    t_dz.op = Op::Transpose;
+                    t_dz.args.push_back(ArgSlot{grad_slot});
+                    t_dz.out_meta = ag::jit::TensorMetadata({n->shape()[1], n->shape()[0]}, n->value.dtype(), n->value.device());
+                    t_dz.out_slot = plan.num_slots++;
+                    plan.steps.push_back(t_dz);
+                    
+                    Step mm;
+                    mm.op = Op::MatMul;
+                    mm.args.push_back(ArgSlot{t_dz.out_slot});
+                    
+                    if (slot_of.count(x)) mm.args.push_back(ArgSlot{slot_of[x]});
+                    else if (is_in(in_ix, x)) mm.args.push_back(ArgInput{in_ix[x]});
+                    else if (is_in(par_ix, x)) mm.args.push_back(ArgParam{par_ix[x]});
+                    else mm.args.push_back(ArgLit{x->value});
+                    
+                    mm.out_meta = ag::jit::TensorMetadata(w->shape(), w->value.dtype(), w->value.device());
+                    mm.out_slot = plan.num_slots++;
+                    plan.steps.push_back(mm);
+                    accumulate_grad(w, mm.out_slot);
+                }
+                
+                // db = sum(dz, dim=0)
+                // Need to reduce along axis 0, not axis 1.
+                // Use transpose-rowsum-transpose pattern:
+                // dz: [B, out] -> transpose -> [out, B] -> rowsum(axis=1) -> [out, 1] -> transpose -> [1, out]
+                if (b->requires_grad()) {
+                    // 1. Transpose dz: [B, out] -> [out, B]
+                    Step t1;
+                    t1.op = Op::Transpose;
+                    t1.args.push_back(ArgSlot{grad_slot});
+                    t1.out_meta = ag::jit::TensorMetadata({n->shape()[1], n->shape()[0]}, n->value.dtype(), n->value.device());
+                    t1.out_slot = plan.num_slots++;
+                    plan.steps.push_back(t1);
+                    
+                    // 2. RowSum: [out, B] -> [out, 1]
+                    Step rs;
+                    rs.op = Op::RowSum;
+                    rs.args.push_back(ArgSlot{t1.out_slot});
+                    rs.out_meta = ag::jit::TensorMetadata({n->shape()[1], 1}, n->value.dtype(), n->value.device());
+                    rs.out_slot = plan.num_slots++;
+                    plan.steps.push_back(rs);
+                    
+                    // 3. Transpose back: [out, 1] -> [1, out]
+                    Step t2;
+                    t2.op = Op::Transpose;
+                    t2.args.push_back(ArgSlot{rs.out_slot});
+                    t2.out_meta = ag::jit::TensorMetadata(b->shape(), b->value.dtype(), b->value.device());
+                    t2.out_slot = plan.num_slots++;
+                    plan.steps.push_back(t2);
+                    
+                    accumulate_grad(b, t2.out_slot);
+                }
+            } else if (n->op == Op::Gather) {
+                 Node* input = n->inputs[0].get();
+                 // dim is input 1 (scalar)
+                 // index is input 2
+                 
+                 if (input->requires_grad()) {
+                     // dx = ScatterAdd(zeros_like(x), dim, index, dz)
+                     
+                     // 1. Zeros like x
+                     Step z;
+                     z.op = Op::Leaf;
+                     Tensor z_t = OwnTensor::Tensor::zeros(Shape(input->shape()), ag::options(input->value));
+                     z.args.push_back(ArgLit{z_t});
+                     z.out_meta = ag::jit::TensorMetadata(input->shape(), input->value.dtype(), input->value.device());
+                     z.out_slot = plan.num_slots++;
+                     plan.steps.push_back(z);
+                     
+                     // 2. ScatterAdd
+                     Step sa;
+                     sa.op = Op::ScatterAdd;
+                     sa.args.push_back(ArgSlot{z.out_slot}); // self
+                     
+                     // dim
+                     if (slot_of.count(n->inputs[1].get())) sa.args.push_back(ArgSlot{slot_of[n->inputs[1].get()]});
+                     else sa.args.push_back(ArgLit{n->inputs[1]->value});
+                     
+                     // index
+                     if (slot_of.count(n->inputs[2].get())) sa.args.push_back(ArgSlot{slot_of[n->inputs[2].get()]});
+                     else sa.args.push_back(ArgLit{n->inputs[2]->value});
+                     
+                     // src = dz
+                     sa.args.push_back(ArgSlot{grad_slot});
+                     
+                     sa.out_meta = z.out_meta;
+                     sa.out_slot = plan.num_slots++;
+                     plan.steps.push_back(sa);
+                     
+                     accumulate_grad(input, sa.out_slot);
+                 }
+            } else if (n->op == Op::ScatterAdd) {
+                Node* self = n->inputs[0].get();
+                Node* src = n->inputs[3].get();
+                // Inputs: 0=self, 1=dim, 2=index, 3=src
+                
+                // d_self = dz
+                if (self->requires_grad()) {
+                    accumulate_grad(self, grad_slot);
+                }
+                
+                // d_src = Gather(dz, dim, index)
+                if (src->requires_grad()) {
+                    Step g;
+                    g.op = Op::Gather;
+                    g.args.push_back(ArgSlot{grad_slot}); // input=dz
+                    
+                    // dim
+                    if (slot_of.count(n->inputs[1].get())) g.args.push_back(ArgSlot{slot_of[n->inputs[1].get()]});
+                    else g.args.push_back(ArgLit{n->inputs[1]->value});
+                    
+                    // index
+                    if (slot_of.count(n->inputs[2].get())) g.args.push_back(ArgSlot{slot_of[n->inputs[2].get()]});
+                    else g.args.push_back(ArgLit{n->inputs[2]->value});
+                    
+                    g.out_meta = ag::jit::TensorMetadata(src->shape(), src->value.dtype(), src->value.device());
+                    g.out_slot = plan.num_slots++;
+                    plan.steps.push_back(g);
+                    
+                    accumulate_grad(src, g.out_slot);
+                }
+            } else if (n->op == Op::SparseCeWithLogits) {
+                // Loss = -mean(log(softmax(logits)[target]))
+                // Grads: (softmax(logits) - one_hot(target)) / N
+                
+                Node* logits = n->inputs[0].get();
+                // Node* target = n->inputs[1].get(); // Indices
+                
+                if (logits->requires_grad()) {
+                    //Softmax(logits)
+                    Step max_s;
+                    max_s.op = Op::RowMax;
+                    
+                    Step sm;
+                    sm.op = Op::SoftmaxRow;
+                    if (slot_of.count(logits)) sm.args.push_back(ArgSlot{slot_of[logits]});
+                    else if (is_in(in_ix, logits)) sm.args.push_back(ArgInput{in_ix[logits]});
+                    else if (is_in(par_ix, logits)) sm.args.push_back(ArgParam{par_ix[logits]});
+                    else sm.args.push_back(ArgLit{logits->value});
+                    
+                    sm.out_meta = ag::jit::TensorMetadata(logits->shape(), logits->value.dtype(), logits->value.device());
+                    sm.out_slot = plan.num_slots++;
+                    plan.steps.push_back(sm);
+                    
+                    // 2. Scale by gy/N
+                    // N (batch size)
+                    int64_t N = logits->shape()[0];
+                    float inv_N = 1.0f / static_cast<float>(N);
+                    
+                    Step scale_lit;
+                    scale_lit.op = Op::Leaf;
+                    Tensor s = OwnTensor::Tensor::full(Shape{{1}}, ag::options(logits->value), inv_N);
+                    scale_lit.args.push_back(ArgLit{s});
+                    scale_lit.out_meta = ag::jit::TensorMetadata({}, logits->value.dtype(), logits->value.device());
+                    scale_lit.out_slot = plan.num_slots++;
+                    plan.steps.push_back(scale_lit);
+                    
+                    Step grad_scale;
+                    grad_scale.op = Op::Mul;
+                    grad_scale.args.push_back(ArgSlot{grad_slot}); // gy
+                    grad_scale.args.push_back(ArgSlot{scale_lit.out_slot});
+                    grad_scale.out_meta = scale_lit.out_meta;
+                    grad_scale.out_slot = plan.num_slots++;
+                    plan.steps.push_back(grad_scale);
+                    
+                    // 3. term1 = softmax * scale
+                    Step term1;
+                    term1.op = Op::Mul;
+                    term1.args.push_back(ArgSlot{sm.out_slot});
+                    term1.args.push_back(ArgSlot{grad_scale.out_slot});
+                    term1.out_meta = sm.out_meta;
+                    term1.out_slot = plan.num_slots++;
+                    plan.steps.push_back(term1);
+                    
+                    // 4. term2 = -scale (value to scatter)
+                    Step neg_s;
+                    neg_s.op = Op::Leaf;
+                    Tensor neg_one = OwnTensor::Tensor::full(Shape{{1}}, ag::options(logits->value), -1.0f);
+                    neg_s.args.push_back(ArgLit{neg_one});
+                    neg_s.out_meta = scale_lit.out_meta;
+                    neg_s.out_slot = plan.num_slots++;
+                    plan.steps.push_back(neg_s);
+                    
+                    Step val_to_scatter;
+                    val_to_scatter.op = Op::Mul;
+                    val_to_scatter.args.push_back(ArgSlot{grad_scale.out_slot});
+                    val_to_scatter.args.push_back(ArgSlot{neg_s.out_slot});
+                    val_to_scatter.out_meta = scale_lit.out_meta;
+                    val_to_scatter.out_slot = plan.num_slots++;
+                    plan.steps.push_back(val_to_scatter);
+                    
+                    // 5. ScatterAdd(term1, 1, target, val_to_scatter)
+                    // This subtracts scale at the target indices
+                    Step sa;
+                    sa.op = Op::ScatterAdd;
+                    sa.args.push_back(ArgSlot{term1.out_slot}); // into term1 (accumulating gradient)
+                    
+                    // dim=1
+                    Step dim_lit;
+                    dim_lit.op = Op::Leaf;
+                    Tensor d = OwnTensor::Tensor::full(Shape{{1}}, ag::options(logits->value), 1.0f);
+                    dim_lit.args.push_back(ArgLit{d});
+                    dim_lit.out_meta = ag::jit::TensorMetadata({}, logits->value.dtype(), logits->value.device());
+                    dim_lit.out_slot = plan.num_slots++;
+                    plan.steps.push_back(dim_lit);
+                    sa.args.push_back(ArgSlot{dim_lit.out_slot});
+                    
+                    // index=target
+                    if (slot_of.count(n->inputs[1].get())) sa.args.push_back(ArgSlot{slot_of[n->inputs[1].get()]});
+                    else sa.args.push_back(ArgLit{n->inputs[1]->value});
+                    
+                    // src=val_to_scatter
+                    sa.args.push_back(ArgSlot{val_to_scatter.out_slot});
+                    
+                    sa.out_meta = term1.out_meta;
+                    sa.out_slot = plan.num_slots++;
+                    plan.steps.push_back(sa);
+                    
+                    accumulate_grad(logits, sa.out_slot);
                 }
             }
-        }
+        } // Closing the loop over order.rbegin()
+
         
         // 3. Collect parameter gradients
         for (const auto& param : params) {

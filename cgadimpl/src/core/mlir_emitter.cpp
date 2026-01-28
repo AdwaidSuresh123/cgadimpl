@@ -182,6 +182,10 @@ MLIREmitter::emitModule(const Plan& plan) {
                 // For literals, we create a nova.constant op
                 const auto& t = a.t;
                 auto shape = t.shape().dims;
+                // Treat 1-element 1D tensors as scalars for MLIR emission
+                if (shape.size() == 1 && shape[0] == 1) {
+                    shape = {};
+                }
                 auto type = createTensorType(builder, shape, t.dtype(), t.device());
                 
                 // For now, support float32 literals
@@ -424,10 +428,10 @@ MLIREmitter::emitModule(const Plan& plan) {
             case Op::SparseCeWithLogits:
                 if (operands.size() == 2) {
                     auto scalarType = mlir::RankedTensorType::get({}, resultType.getElementType(), resultType.getEncoding());
-                    result = builder.create<mlir::nova::SceOp>(
-                        loc, scalarType, operands[0], operands[1]
-                    ).getResult();
-                }
+                        result = builder.create<mlir::nova::SceOp>(
+                            loc, scalarType, operands[0], operands[1]
+                        ).getResult();
+                    }
                 break;
 
             case Op::Gather:
@@ -448,10 +452,21 @@ MLIREmitter::emitModule(const Plan& plan) {
                     int64_t axis = 0;
                     if (auto constOp = operands[1].getDefiningOp<mlir::nova::ConstantOp>()) {
                         auto attr = mlir::cast<mlir::DenseElementsAttr>(constOp.getValue());
-                        axis = static_cast<int64_t>(attr.template getValues<float>()[0]);
+                        axis = static_cast<int64_t>(attr.getValues<float>()[0]);
                     }
                     result = builder.create<mlir::nova::ScatterAddOp>(
                         loc, resultType, operands[0], operands[2], operands[3], builder.getI64IntegerAttr(axis)
+                    ).getResult();
+                }
+                break;
+
+
+
+            case Op::SoftmaxRow:
+                if (operands.size() == 1) {
+                    // Softmax along axis 1 (row)
+                    result = builder.create<mlir::nova::SoftmaxOp>(
+                        loc, resultType, operands[0], builder.getI32IntegerAttr(1)
                     ).getResult();
                 }
                 break;
