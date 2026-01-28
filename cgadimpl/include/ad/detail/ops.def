@@ -92,6 +92,12 @@
 #include "ops/attention.def"
 
 // -----------------------------------------------------------------------------
+// CATEGORY: Indexing Operations
+// Gather, ScatterAdd - select or update elements by indices
+// -----------------------------------------------------------------------------
+#include "ops/indexing.def"
+
+// -----------------------------------------------------------------------------
 // CATEGORY: Loss Functions
 // CrossEntropy, MSE, MAE - measure prediction error for training
 // -----------------------------------------------------------------------------

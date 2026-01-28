@@ -557,7 +557,26 @@ Tensor jvp_ATanh(Node* n, const std::function<const Tensor&(Node*)>& t){
     return T(t, X) / (1.0f - (X->value * X->value));
 }
 
+Tensor jvp_Gather(Node* n, const std::function<const Tensor&(Node*)>& t) {
+    Node* input = n->inputs[0].get();
+    Node* dim_node = n->inputs[1].get();
+    Node* index_node = n->inputs[2].get();
+    
+    int dim = static_cast<int>(dim_node->value.to_cpu().data<float>()[0]);
+    return OwnTensor::gather(T(t, input), dim, index_node->value);
+}
 
+Tensor jvp_ScatterAdd(Node* n, const std::function<const Tensor&(Node*)>& t) {
+    Node* self = n->inputs[0].get();
+    Node* dim_node = n->inputs[1].get();
+    Node* index_node = n->inputs[2].get();
+    Node* src = n->inputs[3].get();
+    
+    int dim = static_cast<int>(dim_node->value.to_cpu().data<float>()[0]);
+    Tensor dy = T(t, self).clone();
+    OwnTensor::scatter_add(dy, dim, index_node->value, T(t, src));
+    return dy;
+}
 
 } // namespace detail
 

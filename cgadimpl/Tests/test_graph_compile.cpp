@@ -5,6 +5,7 @@
 #include "ad/runtime/jit_compiler.hpp"
 
 using namespace ag;
+#include <chrono>
 
 int main() {
     std::cout << "===== JIT COMPILER TEST =====\n";
@@ -53,7 +54,11 @@ int main() {
     // The 'loss' Value is the root of the graph to be compiled
     ag::jit::CompileOptions opts;
     opts.include_backward = true;
+    auto start_compile = std::chrono::high_resolution_clock::now();
     auto comp = ag::jit::compile(loss, inputs, params, opts);
+    auto end_compile = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> compile_ms = end_compile - start_compile;
+    std::cout << "Compile time: " << compile_ms.count() << " ms\n";
 
     std::cout << "Graph compilation successful.\n";
 
@@ -65,7 +70,11 @@ int main() {
     std::vector<Tensor*> par_ptrs = {&W1.node->value, &b1.node->value};
 
     std::vector<Tensor> jit_outputs;
+    auto start_run = std::chrono::high_resolution_clock::now();
     bool ok = comp.run(in_ptrs, par_ptrs, jit_outputs);
+    auto end_run = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> run_ms = end_run - start_run;
+    std::cout << "Graph execution time: " << run_ms.count() << " ms\n";
     
     if (!ok) {
         std::cerr << "FAIL: JIT execution failed (shape guard or other error).\n";

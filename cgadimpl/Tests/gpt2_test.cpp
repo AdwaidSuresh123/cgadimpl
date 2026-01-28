@@ -640,7 +640,7 @@ int main() {
         const int T = 1024;
         const std::string data_root = "/home/blu-bridge006/Desktop/cgadimpl/Data";
         
-        cudaSetDevice(1);  // GPU 1 has more free memory
+        cudaSetDevice(0);  // GPU 1 has more free memory
         
         std::cout << "Initializing model..." << std::endl;
         GPT model(config);

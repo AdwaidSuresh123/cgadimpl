@@ -232,6 +232,7 @@ if(true)
   add_ag_test(test_jit_edge_cases                             Tests/test_jit_edge_cases.cpp)
   add_ag_test(gpt2_test                                       Tests/gpt2_test.cpp)
   add_ag_test(jit_mlp_test                                    Tests/jit_mlp_test.cpp)
+  add_ag_test(gpt2_jit_test                                   Tests/gpt2_jit_test.cpp)
  
   # Ops Tests
 #   add_ag_test(test_activation                  Tests/ops_test/test_activation.cpp)
