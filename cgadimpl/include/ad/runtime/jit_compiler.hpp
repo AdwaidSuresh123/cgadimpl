@@ -13,6 +13,12 @@ namespace ag::jit {
 // JIT Compiler Interface
 // ===================================================================
 
+struct JITMetrics {
+    int64_t total_flops = 0;
+    int64_t io_bytes = 0;
+    int64_t total_intermediate_bytes = 0;
+};
+
 struct Compiled {
     struct Impl;
     std::shared_ptr<Impl> p;
@@ -23,6 +29,7 @@ struct Compiled {
     std::string mlir_module_str;
     void* compiled_func = nullptr;
     std::shared_ptr<void> aot_context;
+
     // Execute the compiled plan
     bool run(const std::vector<Tensor*>& inputs,
              const std::vector<Tensor*>& params,
@@ -31,6 +38,8 @@ struct Compiled {
     bool run(const std::vector<Tensor*>& inputs,
              const std::vector<Tensor*>& params,
              std::vector<Tensor>& outs) const;
+
+    JITMetrics getMetrics() const;
 
     const std::string& getMLIRSource() const;
     void* getMLIRModule() const;

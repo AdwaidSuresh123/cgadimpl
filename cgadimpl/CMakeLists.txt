@@ -148,6 +148,10 @@ target_link_libraries(cgadimpl PUBLIC
     MLIRPass
     MLIRSupport
     LLVMSupport
+    
+    # CUDA libraries
+    CUDA::cudart
+    CUDA::cuda_driver
 )
 # --- FIX: Prioritize Local NovaCompiler Includes ---
 # We derive the include path from the mlir-compiler_DIR which is passed as
@@ -165,7 +169,16 @@ if(true)
   enable_testing()
   function(add_ag_test name src)
     add_executable(${name} ${src})
-    target_link_libraries(${name} PRIVATE cgadimpl::cgadimpl CUDA::cudart OpenMP::OpenMP_CXX)
+    target_link_libraries(${name} PRIVATE 
+        cgadimpl::cgadimpl 
+        CUDA::cudart 
+        CUDA::cuda_driver
+        OpenMP::OpenMP_CXX
+        # Link against MLIR runner utils to ensure they are in the process symbol space
+        "/home/blu-bridge023/Desktop/llvm-project/build/lib/libmlir_cuda_runtime.so"
+        "/home/blu-bridge023/Desktop/llvm-project/build/lib/libmlir_runner_utils.so"
+        "/home/blu-bridge023/Desktop/llvm-project/build/lib/libmlir_c_runner_utils.so"
+    )
     set_target_properties(${name} PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
     add_test(NAME ${name} COMMAND ${name})
   endfunction()

@@ -4,6 +4,14 @@
 #include "ad/core/mlir_emitter.hpp"
 #include "Compiler/API/NovaCompilerAPI.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/Support/TargetSelect.h"
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <dlfcn.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -29,16 +37,12 @@ struct ResultMetadata {
 
 struct AOTContext {
     void* ciface_func = nullptr;
-    void* dl_handle = nullptr;
+    std::shared_ptr<llvm::orc::LLJIT> jit;  // In-memory JIT engine (replaces dl_handle)
     Plan plan;
-    std::string mlir_source;
     std::vector<ResultMetadata> result_meta;
+    bool is_gpu = false;
 
-    ~AOTContext() {
-        if (dl_handle) {
-            dlclose(dl_handle);
-        }
-    }
+    // No destructor needed - shared_ptr handles LLJIT cleanup
 };
 
 static size_t getElementSize(OwnTensor::Dtype dtype) {
@@ -63,9 +67,9 @@ struct Compiled::Impl {
     Plan plan;
 };
 
-// Forward declarations for AOT compilation helpers
-void* compileAndLoad(const std::string& mlir_source, void** out_dl_handle, const std::string& device);
-void storeAOTContext(void* func_ptr, void* dl_handle, const Plan& plan, const std::string& mlir_source, std::shared_ptr<void>& out_context);
+void* compileAndLoad(mlir::ModuleOp mlirModule,
+                     const std::string& device,
+                     std::unique_ptr<llvm::orc::LLJIT>& outJIT);
 
 static std::vector<int64_t> getMLIRShape(const std::vector<int64_t>& dims, Op op) {
     // Nova compiler expects rank-0 for total reductions that result in a single element
@@ -80,12 +84,6 @@ static std::vector<int64_t> getMLIRShape(const std::vector<int64_t>& dims, Op op
 }
 
 static bool is_in(const std::unordered_map<Node*,int>& m, Node* n){ return m.find(n)!=m.end(); }
-
-
-
-// Forward declarations for AOT compilation helpers
-void* compileAndLoad(const std::string& mlir_source, void** out_dl_handle, const std::string& device);
-void storeAOTContext(void* func_ptr, void* dl_handle, const Plan& plan, const std::string& mlir_source, std::shared_ptr<void>& out_context);
 
 // Mutex for serializing JIT compilation to prevent race conditions
 static std::mutex jit_compilation_mutex;
@@ -792,26 +790,45 @@ Compiled compile(const Value& output,
         }
         */
 
+        // ===================================================================
+        // JIT Compilation BEFORE moving the module
+        // ===================================================================
+        std::unique_ptr<llvm::orc::LLJIT> jit;
+        void* func_ptr = compileAndLoad(in_memory_module.get(), use_gpu ? "gpu" : "cpu", jit);
+        
+        // Store module for potential later use (after compilation)
         auto* module_ptr = new mlir::OwningOpRef<mlir::ModuleOp>(std::move(in_memory_module));
         c.mlir_module = std::shared_ptr<void>(module_ptr, [context](void* p) {
             delete static_cast<mlir::OwningOpRef<mlir::ModuleOp>*>(p);
         });
+
+        // Store AOT Context if compilation succeeded
+        if (func_ptr) {
+            c.compiled_func = func_ptr;
+            auto* ctx = new AOTContext();
+            ctx->ciface_func = func_ptr;
+            ctx->jit = std::move(jit);
+            ctx->plan = c.p->plan;
+            ctx->is_gpu = use_gpu;
+            // Cache result metadata
+            for (int slot : ctx->plan.out_slots) {
+                bool found = false;
+                for (const auto& step : ctx->plan.steps) {
+                    if (step.out_slot == slot) {
+                        ctx->result_meta.push_back({step.out_meta.shape, step.out_meta.dtype, step.out_meta.device});
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    ctx->result_meta.push_back({{}, OwnTensor::Dtype::Float32, OwnTensor::DeviceIndex(OwnTensor::Device::CPU)});
+                }
+            }
+            c.aot_context = std::shared_ptr<AOTContext>(ctx);
+        }
     }
 
     c.mlir_module_str = std::move(generated_mlir_opbuilder);
-
-    // ===================================================================
-    // NEW: Perform AOT Compilation Immediately (Eager Compilation)
-    // ===================================================================
-    if (!c.mlir_source.empty()) {
-        void* dl_handle = nullptr;
-        void* func_ptr = compileAndLoad(c.mlir_source, &dl_handle, use_gpu ? "gpu" : "cpu");
-        
-        if (func_ptr) {
-            c.compiled_func = func_ptr;
-            storeAOTContext(func_ptr, dl_handle, c.p->plan, c.mlir_source, c.aot_context);
-        }
-    }
 
     return c;
 }
@@ -979,7 +996,22 @@ extern "C" void* ABIAdapter(void** args, void* context_ptr) {
         cleanup(); return nullptr;
     }
 
+    // Ensure GPU is ready if any CUDA tensors are involved
+    bool has_cuda = context->is_gpu;
+    if (!has_cuda) {
+        // Fallback check results
+        for (const auto& meta : context->result_meta) {
+            if (meta.device.device == OwnTensor::Device::CUDA) {
+                has_cuda = true; break;
+            }
+        }
+    }
+
+    if (has_cuda) cudaDeviceSynchronize();
+
     reinterpret_cast<CIfaceFunc>(context->ciface_func)(packed_output_raw, desc_ptrs.data());
+
+    if (has_cuda) cudaDeviceSynchronize();
 
     auto* output_tensors = new std::vector<Tensor>();
     std::unordered_set<void*> handled_ptrs;
@@ -1119,130 +1151,130 @@ extern "C" void* ABIAdapter(void** args, void* context_ptr) {
 // Wrapper Declaration (must be global)
 extern "C" void* LegacyInterpWrapper(void**);
 
-void* compileAndLoad(const std::string& mlir_source, void** out_dl_handle, const std::string& device) {
-    // FIX: Use thread_local for RNG to avoid race conditions in multi-threaded environment
-    thread_local std::random_device rd;
-    thread_local std::mt19937 gen(rd());
-    std::uniform_int_distribution<uint64_t> dist;
-    
-    // FIX: Serialize compilation to prevent file collisions and system call races
-    std::lock_guard<std::mutex> lock(jit_compilation_mutex);
-    
-    std::stringstream ss;
-    ss << "/tmp/nova_jit_" << std::hex << dist(gen);
-    std::string base_path = ss.str();
-    
-    std::string mlir_file = base_path + ".mlir";
-    std::string ll_file = base_path + ".ll"; // NEW: for LLVM IR
-    std::string obj_file = base_path + ".o";
-    std::string so_file = base_path + ".so";
-    
-    // Detect if the input is already LLVM IR (assembly) vs MLIR
-    bool is_llvm_ir = (mlir_source.find("target triple") != std::string::npos && 
-                        mlir_source.find("module attributes") == std::string::npos &&
-                        mlir_source.find("module {") == std::string::npos);
+void* compileAndLoad(mlir::ModuleOp mlirModule,
+                     const std::string &device,
+                     std::unique_ptr<llvm::orc::LLJIT>& outJIT) {
+     // Initialize LLVM and global symbols for JIT
+     static bool jit_initialized = []() {
+         llvm::InitializeNativeTarget();
+         llvm::InitializeNativeTargetAsmPrinter();
+         llvm::InitializeNativeTargetAsmParser();
 
-    {
-        std::ofstream out(is_llvm_ir ? ll_file : mlir_file);
-        out << mlir_source;
-        out.close();
-    }
-    
-    if (!is_llvm_ir) {
-        #ifndef NOVA_OPT_BIN
-            #define NOVA_OPT_BIN "nova-opt"
-        #endif
-        std::string nova_opt = NOVA_OPT_BIN;
-        bool success = mlir::nova::NovaCompilerSystemAPI::compileToObject(mlir_file, obj_file, nova_opt, device);
-        if (!success) {
-            std::remove(mlir_file.c_str());
-            return nullptr;
-        }
-    } else {
-        // Input is already LLVM IR, compile directly to object file
-        std::string llc_cmd = "llc " + ll_file + " -relocation-model=pic -filetype=obj -o " + obj_file;
-        if (system(llc_cmd.c_str()) != 0) {
-            std::cerr << "Error: LLC failed for LLVM IR: " << llc_cmd << "\n";
-            std::remove(ll_file.c_str());
-            return nullptr;
-        }
-    }
-    
-    std::string link_flags;
-    if (device == "gpu") {
-        const char* llvm_env = std::getenv("LLVM_DIR");
-        std::string llvm_lib_dir = llvm_env ? std::string(llvm_env) + "/lib" : "/home/blu-bridge006/Desktop/llvm-project/build/lib";
-        link_flags = " -L" + llvm_lib_dir + " -lmlir_cuda_runtime -lmlir_runner_utils -lmlir_c_runner_utils" +
-                     " -L/usr/local/cuda/lib64 -lcudart" +
-                     " -Wl,-rpath," + llvm_lib_dir +
-                     " -Wl,-rpath,/usr/local/cuda/lib64";
-    }
-    std::string link_cmd = "g++ -shared -fPIC -o " + so_file + " " + obj_file + link_flags + " -ldl -lm";
+         // Initialize CUDA Runtime API early by calling a no-op CUDA function.
+         // This ensures the primary context is created by the Runtime API.
+         cudaFree(0);
 
-    if (system(link_cmd.c_str()) != 0) {
-        std::cerr << "Error: Linking JIT shared library failed: " << link_cmd << "\n";
-        std::remove(mlir_file.c_str());
-        std::remove(ll_file.c_str());
-        std::remove(obj_file.c_str());
+         // Initialize CUDA Driver API and ensure primary context is initialized
+         if (cuInit(0) == CUDA_SUCCESS) {
+             CUdevice device;
+             CUcontext ctx;
+             if (cuDeviceGet(&device, 0) == CUDA_SUCCESS) {
+                 // Retain the primary context once and keep it alive for the process duration.
+                 if (cuDevicePrimaryCtxRetain(&ctx, device) == CUDA_SUCCESS) {
+                     // VERY IMPORTANT: Make this primary context current during initialization
+                     // so that any subsequently loaded libraries (like MLIR runners)
+                     // capture and use this same context by default.
+                     cuCtxSetCurrent(ctx);
+                 }
+             }
+         }
+
+         // Pre-load MLIR runner libraries into global symbol space.
+         // This ensures that the JIT-compiled code can resolve these symbols 
+         // even when using GetForCurrentProcess.
+         const char* llvm_lib_dir = "/home/blu-bridge023/Desktop/llvm-project/build/lib";
+         std::vector<std::string> libs = {
+             std::string(llvm_lib_dir) + "/libmlir_cuda_runtime.so",
+             std::string(llvm_lib_dir) + "/libmlir_runner_utils.so",
+             std::string(llvm_lib_dir) + "/libmlir_c_runner_utils.so"
+         };
+         
+         for (const auto& lib : libs) {
+             void* handle = dlopen(lib.c_str(), RTLD_NOW | RTLD_GLOBAL);
+             if (!handle) {
+                 // std::cerr << "Warning: JIT could not pre-load " << lib << ": " << dlerror() << "\n";
+             }
+         }
+         return true;
+     }();
+
+     auto llvmContext = std::make_unique<llvm::LLVMContext>();
+     mlir::nova::NovaCompilerAPI compiler;
+     
+     // Create options for compilation
+     mlir::nova::CompilerOptions options;
+     options.runFullPipeline = true;
+     options.device = device;
+     options.verbose = false;
+     
+     auto llvmModule = compiler.compileToLLVMModule(mlirModule, *llvmContext, options);
+     if (!llvmModule) {
+        std::cerr << "Error: NovaCompilerAPI compilation failed\n";
+        return nullptr;
+     }
+
+     auto jitOrErr = llvm::orc::LLJITBuilder()
+        .setNumCompileThreads(0)  // Synchronous compilation
+        .setJITTargetMachineBuilder(
+            cantFail(llvm::orc::JITTargetMachineBuilder::detectHost()))
+        .create();
+
+    if (!jitOrErr) {
+        std::cerr << "Error: Failed to create LLJIT\n";
         return nullptr;
     }
+    outJIT = std::move(*jitOrErr);
     
-    void* handle = dlopen(so_file.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    // Optimizer with correct signature (MaterializationResponsibility)
+    auto optimizer = [](llvm::orc::ThreadSafeModule TSM,
+                        const llvm::orc::MaterializationResponsibility &R) 
+            -> llvm::Expected<llvm::orc::ThreadSafeModule> {
+        TSM.withModuleDo([](llvm::Module &M) {
+            llvm::PassBuilder PB;
+            llvm::LoopAnalysisManager LAM;
+            llvm::FunctionAnalysisManager FAM;
+            llvm::CGSCCAnalysisManager CGAM;
+            llvm::ModuleAnalysisManager MAM;
+            
+            PB.registerModuleAnalyses(MAM);
+            PB.registerCGSCCAnalyses(CGAM);
+            PB.registerFunctionAnalyses(FAM);
+            PB.registerLoopAnalyses(LAM);
+            PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+            
+            auto MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
+            MPM.run(M, MAM);
+        });
+        return std::move(TSM);
+    };
+    outJIT->getIRTransformLayer().setTransform(std::move(optimizer));
     
-    // Clean up temporary compilation artifacts
-    std::remove(mlir_file.c_str());
-    std::remove(ll_file.c_str());
-    std::remove(obj_file.c_str());
-    std::remove(so_file.c_str()); 
+    auto& MainJD = outJIT->getMainJITDylib();
+    auto& DL = outJIT->getDataLayout();
 
-    if (!handle) {
-        std::cerr << "Error: dlopen failed: " << dlerror() << "\n";
+    MainJD.addGenerator(llvm::cantFail(llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(DL.getGlobalPrefix())));
+
+    // If we're on GPU, we've already pre-loaded the necessary libraries with RTLD_GLOBAL.
+    // DynamicLibrarySearchGenerator::GetForCurrentProcess will find them.
+    // If not, we could add fallbacks here, but pre-loading is more robust for CUDA state.
+    auto tsm = llvm::orc::ThreadSafeModule(std::move(llvmModule),std::move(llvmContext));
+    if(auto err =outJIT->addIRModule(std::move(tsm))) return nullptr;
+
+    // IMPORTANT: Explicitly run global initializers. 
+    // This is required to execute the .text.startup sections generated by MLIR, 
+    // which call `mgpuModuleLoadJIT` to load the CUDA kernels.
+    if (auto Err = outJIT->initialize(outJIT->getMainJITDylib())) {
+        llvm::errs() << "Error: JIT initialization failed: " << Err << "\n";
         return nullptr;
     }
-    
-    if (out_dl_handle) *out_dl_handle = handle;
-    
-    // Search for entry point symbol (mangled or unmangled)
-    const char* symbols[] = {"_mlir_ciface_main", "mlir_ciface_main", "main"};
-    void* func_ptr = nullptr;
-    for (const char* sym : symbols) {
-        if ((func_ptr = dlsym(handle, sym))) break;
-    }
 
-    if (!func_ptr) {
-        std::cerr << "Error: Could not find any executable symbol in JIT library\n";
-        dlclose(handle);
-        if (out_dl_handle) *out_dl_handle = nullptr;
-        return nullptr;
-    }
-    
-    return func_ptr;
+    auto sym =outJIT->lookup("_mlir_ciface_main");
+    if(!sym) return nullptr;
+    return (void*)sym->getValue();  
 }
 
-void storeAOTContext(void* func_ptr, void* dl_handle, const Plan& plan, const std::string& mlir_source, std::shared_ptr<void>& out_context) {
-    auto* ctx = new AOTContext();
-    ctx->ciface_func = func_ptr;
-    ctx->dl_handle = dl_handle;
-    ctx->plan = plan;
-    ctx->mlir_source = mlir_source;
 
-    // Cache result metadata to avoid re-calculating on every run
-    for (int slot : plan.out_slots) {
-        bool found = false;
-        for (const auto& step : plan.steps) {
-            if (step.out_slot == slot) {
-                ctx->result_meta.push_back({step.out_meta.shape, step.out_meta.dtype, step.out_meta.device});
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            ctx->result_meta.push_back({{}, OwnTensor::Dtype::Float32, OwnTensor::DeviceIndex(OwnTensor::Device::CPU)});
-        }
-    }
-
-    out_context = std::shared_ptr<AOTContext>(ctx); 
-}
+// storeAOTContext removed - context creation is now inlined at call site
 
 
 
@@ -1254,6 +1286,117 @@ bool Compiled::run(const std::vector<Tensor*>& inputs,
     if (outs.empty()) return false;
     out = std::move(outs[0]);
     return true;
+}
+
+JITMetrics Compiled::getMetrics() const {
+    if (!p) return {};
+    const auto& plan = p->plan;
+    JITMetrics m;
+
+    // 1. Calculate IO Bytes (Inputs + Params + Outputs)
+    auto calc_meta_bytes = [&](const TensorMetadata& meta) {
+        int64_t elements = 1;
+        for (auto d : meta.shape) elements *= d;
+        return elements * getElementSize(meta.dtype);
+    };
+
+    for (const auto& meta : plan.sig.in_meta) m.io_bytes += calc_meta_bytes(meta);
+    for (const auto& meta : plan.sig.param_meta) m.io_bytes += calc_meta_bytes(meta);
+    
+    // Outputs
+    std::unordered_set<int> out_slot_set(plan.out_slots.begin(), plan.out_slots.end());
+
+    // Pre-cache slot shapes to avoid O(N^2) lookups
+    std::unordered_map<int, std::vector<int64_t>> slot_shapes;
+    for (const auto& step : plan.steps) {
+        slot_shapes[step.out_slot] = step.out_meta.shape;
+    }
+
+    auto get_shape = [&](const Arg& arg) -> std::vector<int64_t> {
+        if (std::holds_alternative<ArgSlot>(arg)) {
+            int slot = std::get<ArgSlot>(arg).slot;
+            if (slot_shapes.count(slot)) return slot_shapes[slot];
+        } else if (std::holds_alternative<ArgInput>(arg)) {
+            return plan.sig.in_meta[std::get<ArgInput>(arg).idx].shape;
+        } else if (std::holds_alternative<ArgParam>(arg)) {
+            return plan.sig.param_meta[std::get<ArgParam>(arg).idx].shape;
+        } else if (std::holds_alternative<ArgLit>(arg)) {
+            auto dims = std::get<ArgLit>(arg).t.shape().dims;
+            return std::vector<int64_t>(dims.begin(), dims.end());
+        }
+        return {};
+    };
+
+    // 2. Analyze steps for FLOPS and Intermediate memory
+    for (const auto& step : plan.steps) {
+        int64_t out_elements = 1;
+        for (auto d : step.out_meta.shape) out_elements *= d;
+        size_t out_bytes = out_elements * getElementSize(step.out_meta.dtype);
+
+        // If it's an output slot, add to IO bytes, otherwise it's intermediate
+        if (out_slot_set.count(step.out_slot)) {
+            m.io_bytes += out_bytes;
+        } else {
+            m.total_intermediate_bytes += out_bytes;
+        }
+
+        // FLOPS Estimation
+        switch (step.op) {
+            case Op::MatMul: {
+                if (step.args.size() >= 2) {
+                    auto shapeA = get_shape(step.args[0]);
+                    auto shapeB = get_shape(step.args[1]);
+                    if (shapeA.size() >= 2 && shapeB.size() >= 2) {
+                        int64_t M = shapeA[0];
+                        int64_t K = shapeA[1];
+                        int64_t N = shapeB[1];
+                        m.total_flops += 2 * M * N * K;
+                    }
+                }
+                break;
+            }
+            case Op::Add:
+            case Op::Sub:
+            case Op::Mul:
+            case Op::Div:
+            case Op::Relu:
+            case Op::GELU:
+            case Op::Tanh:
+            case Op::Sign:
+            case Op::Exp:
+            case Op::Log:
+                // Element-wise ops: 1 FLOP per output element (approx)
+                m.total_flops += out_elements;
+                break;
+            case Op::MSELoss:
+                // (x-y)^2 => Sub, Mul, MeanAll. 
+                // Approx 3 FLOPS per element
+                m.total_flops += 3 * out_elements; // out_elements here is 1 usually, but we mean the input elements
+                // Wait, MSELoss in the plan has out_meta as scalar. We need input size.
+                if (step.args.size() >= 1) {
+                    auto shapeIn = get_shape(step.args[0]);
+                    int64_t in_elements = 1;
+                    for (auto d : shapeIn) in_elements *= d;
+                    m.total_flops += 3 * in_elements;
+                }
+                break;
+            case Op::Sum:
+            case Op::MeanAll:
+            case Op::RowSum:
+                // Reductions: Approx 1 FLOP per input element
+                if (step.args.size() >= 1) {
+                    auto shapeIn = get_shape(step.args[0]);
+                    int64_t in_elements = 1;
+                    for (auto d : shapeIn) in_elements *= d;
+                    m.total_flops += in_elements;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    return m;
 }
 
 const std::string& Compiled::getMLIRSource() const {

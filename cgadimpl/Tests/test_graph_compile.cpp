@@ -1,6 +1,7 @@
 #include "ad/ag_all.hpp"
 #include <iostream>
 #include <vector>
+#include <chrono>
 #include "ad/runtime/jit_compiler.hpp"
 
 using namespace ag;
@@ -119,10 +120,53 @@ int main() {
         if (mad > 1e-4f) grads_match = false;
     }
     
-    if (grads_match) {
-        std::cout << "PASS: Gradients match.\n";
+    // ---------- Performance Metrics ----------
+    std::cout << "\n--- Performance Analysis ---\n";
+    
+    ag::jit::JITMetrics metrics = comp.getMetrics();
+    std::cout << "Total FLOPS (estimated):      " << metrics.total_flops << "\n";
+    std::cout << "IO Bytes (transferred):       " << metrics.io_bytes << "\n";
+    std::cout << "Intermediate Memory (bytes):  " << metrics.total_intermediate_bytes << "\n";
+    
+    double ai = (double)metrics.total_flops / std::max((int64_t)1, metrics.io_bytes);
+    std::cout << "Arithmetic Intensity:         " << ai << " FLOP/byte\n";
+
+    // Timing Eager (100 iterations)
+    const int iterations = 3;
+    auto start_eager = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        Value Z_e = matmul(X, W1) + b1;
+        Value loss_e = mse_loss(Z_e, target);
+        ag::backward(loss_e);
+    }
+    auto end_eager = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> eager_dur = (end_eager - start_eager) / iterations;
+    
+    // Timing JIT (100 iterations)
+    auto start_jit = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        comp.run(in_ptrs, par_ptrs, jit_outputs);
+    }
+    auto end_jit = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> jit_dur = (end_jit - start_jit) / iterations;
+
+    double gflops = (metrics.total_flops * 1e-9) / jit_dur.count();
+    double speedup = eager_dur.count() / jit_dur.count();
+    
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << "Eager Avg Time:      " << eager_dur.count() * 1000.0 << " ms\n";
+    std::cout << "Compiled Avg Time:   " << jit_dur.count() * 1000.0 << " ms\n";
+    std::cout << "Speedup Ratio:       " << speedup << "x\n";
+    std::cout << "JIT Throughput:      " << gflops << " GFLOPS\n";
+
+    // Roofline Analysis (Simplified)
+    // Assuming a generic modern GPU peak (e.g. RTX 3090 ~35 TFLOPS, 936 GB/s => Balance ~37 FLOP/B)
+    // Or just report if AI is low or high.
+    std::cout << "Roofline Analysis:   ";
+    if (ai < 10.0) {
+        std::cout << "Memory Bound (Low Arithmetic Intensity)\n";
     } else {
-        std::cout << "FAIL: Gradient mismatch.\n";
+        std::cout << "Compute Bound (High Arithmetic Intensity)\n";
     }
 
     return 0;

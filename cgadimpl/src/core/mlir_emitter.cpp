@@ -9,6 +9,37 @@
 #include "mlir/IR/MLIRContext.h"
 #include "Compiler/Dialect/nova/NovaDialect.h"
 #include "Compiler/Dialect/nova/NovaOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Tosa/IR/TosaOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+#include "mlir/Conversion/GPUCommon/GPUToLLVM.h"
+#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+#include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+#include "mlir/Conversion/ComplexToLLVM/ComplexToLLVM.h"
+#include "mlir/Target/LLVMIR/Dialect/All.h"
+
+#include "Compiler/API/NovaCompilerAPI.h"
 
 namespace ag::jit {
 
@@ -20,10 +51,10 @@ MLIREmitter::MLIREmitter() {
 MLIREmitter::~MLIREmitter() = default;
 
 void MLIREmitter::registerDialects() {
-    // The emitter only needs Nova and Func dialects to build the initial IR.
-    // Optimization and bufferization are now handled within NovaCompilerAPI.
-    context_->getOrLoadDialect<mlir::nova::NovaDialect>();
-    context_->getOrLoadDialect<mlir::func::FuncDialect>();
+    mlir::DialectRegistry registry;
+    mlir::nova::NovaCompilerAPI::registerAllDialects(registry);
+    context_->appendDialectRegistry(registry);
+    context_->loadAllAvailableDialects();
 }
 
 mlir::Type MLIREmitter::dtypeToMLIRType(mlir::OpBuilder& builder, OwnTensor::Dtype dtype) {

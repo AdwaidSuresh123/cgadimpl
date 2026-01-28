@@ -4,9 +4,11 @@
 #include <iomanip>
 #include <cmath>
 #include <random>
+#include <chrono>
 
 #include "ad/ag_all.hpp"
 #include "ad/runtime/jit_compiler.hpp"
+#include <cuda_runtime.h>
 #include "TensorLib.h"
 
 using namespace ag;
@@ -60,10 +62,10 @@ void test_large_scale_mlp() {
     const int H2 = 512;
     const int Out = 10;
 
-    Value X = make_tensor(Tensor::randn<float>(Shape{{B, In}}, TensorOptions()), "X");
-    Value Y = make_tensor(Tensor::randn<float>(Shape{{B, Out}}, TensorOptions()), "Y");
+    Value X = make_tensor(Tensor::randn<float>(Shape{{B, In}}, TensorOptions().with_device(Device::CUDA)), "X");
+    Value Y = make_tensor(Tensor::randn<float>(Shape{{B, Out}}, TensorOptions().with_device(Device::CUDA)), "Y");
 
-    auto opts = TensorOptions().with_req_grad(true);
+    auto opts = TensorOptions().with_req_grad(true).with_device(Device::CUDA);
     auto W1 = make_tensor(Tensor::randn<float>(Shape{{In, H1}}, opts) * 0.01f, "W1");
     auto b1 = make_tensor(Tensor::zeros(Shape{{1, H1}}, opts), "b1");
     auto W2 = make_tensor(Tensor::randn<float>(Shape{{H1, H2}}, opts) * 0.01f, "W2");
@@ -95,6 +97,54 @@ void test_large_scale_mlp() {
 
     verify_results("Large Scale MLP", eager_loss, jit_outs[0].to_cpu().data<float>()[0], 
                   {"W1", "b1", "W2", "b2", "W3", "b3"}, params, jit_outs);
+
+    // ---------- Performance Metrics ----------
+    std::cout << "\n--- Performance Analysis: Large MLP ---\n";
+    
+    ag::jit::JITMetrics metrics = comp.getMetrics();
+    std::cout << "Total FLOPS (estimated):      " << metrics.total_flops << "\n";
+    std::cout << "IO Bytes (transferred):       " << metrics.io_bytes << "\n";
+    
+    double ai = (double)metrics.total_flops / std::max((int64_t)1, metrics.io_bytes);
+    std::cout << "Arithmetic Intensity:         " << ai << " FLOP/byte\n";
+
+    const int iterations = 100; // Stable count
+    auto start_eager = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        Value L1_e = relu(matmul(X, W1) + b1);
+        Value L2_e = relu(matmul(L1_e, W2) + b2);
+        Value logits_e = matmul(L2_e, W3) + b3;
+        Value loss_e = mse_loss(logits_e, Y);
+        ag::backward(loss_e);
+    }
+    cudaStreamSynchronize(ag::current_stream());
+    auto end_eager = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> eager_dur = (end_eager - start_eager) / iterations;
+    
+    std::vector<Tensor*> in_t_ptr = {&X.node->value, &Y.node->value};
+    std::vector<Tensor*> pa_t_ptr = {&W1.node->value, &b1.node->value, &W2.node->value, &b2.node->value, &W3.node->value, &b3.node->value};
+    std::vector<Tensor> dummy_outs;
+
+    auto start_jit = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        if (!comp.run(in_t_ptr, pa_t_ptr, dummy_outs)) {
+             std::cerr << "FAIL: JIT execution failed in timing loop\n";
+             return;
+        }
+        dummy_outs.clear();
+    }
+    cudaStreamSynchronize(ag::current_stream());
+    auto end_jit = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> jit_dur = (end_jit - start_jit) / iterations;
+
+    double gflops = (metrics.total_flops * 1e-9) / jit_dur.count();
+    double speedup = eager_dur.count() / jit_dur.count();
+    
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << "Eager Avg Time:      " << eager_dur.count() * 1000.0 << " ms\n";
+    std::cout << "Compiled Avg Time:   " << jit_dur.count() * 1000.0 << " ms\n";
+    std::cout << "Speedup Ratio:       " << speedup << "x\n";
+    std::cout << "JIT Throughput:      " << gflops << " GFLOPS\n";
 }
 
 void test_complex_broadcasting() {
@@ -121,7 +171,10 @@ void test_complex_broadcasting() {
     std::vector<Tensor*> in_t = {&A.node->value};
     std::vector<Tensor*> pa_t = {&B.node->value, &C.node->value};
     std::vector<Tensor> jit_outs;
-    comp.run(in_t, pa_t, jit_outs);
+    if (!comp.run(in_t, pa_t, jit_outs)) {
+        std::cerr << "FAIL: JIT execution failed for Complex Broadcasting\n";
+        return;
+    }
 
     verify_results("Broadcasting", eager_loss, jit_outs[0].to_cpu().data<float>()[0], 
                   {"B", "C"}, params, jit_outs);
